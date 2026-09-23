@@ -1,4 +1,22 @@
 services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: rag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: rag_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
   backend:
     build:
       context: .
@@ -9,8 +27,16 @@ services:
       - "8001:8001"
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql+psycopg://postgres:password123@db:5432/rag_db
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
       - ./src:/app/src
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:

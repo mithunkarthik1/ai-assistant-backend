@@ -105,16 +105,34 @@ async def init_db() -> None:
                 cmetadata JSONB
             )
             """))
-            await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
-                id VARCHAR PRIMARY KEY,
-                collection_id UUID REFERENCES langchain_pg_collection (uuid) ON DELETE CASCADE,
-                embedding float8[],
-                document VARCHAR,
-                cmetadata JSONB
-            )
-            """))
-        logger.info("Application and embedding tables initialized successfully.")
+            # Create embedding table with native pgvector type
+            try:
+                await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
+                    id VARCHAR PRIMARY KEY,
+                    collection_id UUID REFERENCES langchain_pg_collection (uuid) ON DELETE CASCADE,
+                    embedding vector(384),
+                    document VARCHAR,
+                    cmetadata JSONB
+                )
+                """))
+                # Create HNSW index for sub-millisecond approximate nearest neighbor searches
+                await conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_langchain_pg_embedding_hnsw 
+                ON langchain_pg_embedding USING hnsw (embedding vector_cosine_ops)
+                """))
+            except Exception as e:
+                logger.debug("pgvector native type fallback: %s", e)
+                await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
+                    id VARCHAR PRIMARY KEY,
+                    collection_id UUID REFERENCES langchain_pg_collection (uuid) ON DELETE CASCADE,
+                    embedding float8[],
+                    document VARCHAR,
+                    cmetadata JSONB
+                )
+                """))
+        logger.info("Application, pgvector tables, and HNSW indexes initialized successfully.")
     except Exception as e:
         logger.warning("Could not initialize PostgreSQL tables: %s (Running in local mode)", e)
 

@@ -231,20 +231,37 @@ async def store_documents(documents: Sequence[Document]) -> list[str]:
                 {"uuid": collection_id, "name": "rag_documents"},
             )
             for entry in local_entries:
-                await conn.execute(
-                    text("""
-                    INSERT INTO langchain_pg_embedding (id, collection_id, embedding, document, cmetadata)
-                    VALUES (:id, :col_id, CAST(:vec AS float8[]), :doc, CAST(:meta AS jsonb))
-                    ON CONFLICT (id) DO UPDATE SET embedding = excluded.embedding, document = excluded.document, cmetadata = excluded.cmetadata
-                    """),
-                    {
-                        "id": entry["id"],
-                        "col_id": collection_id,
-                        "vec": entry["embedding"],
-                        "doc": entry["document"],
-                        "meta": json.dumps(entry["cmetadata"]),
-                    },
-                )
+                vec_str = "[" + ",".join(str(f) for f in entry["embedding"]) + "]"
+                try:
+                    await conn.execute(
+                        text("""
+                        INSERT INTO langchain_pg_embedding (id, collection_id, embedding, document, cmetadata)
+                        VALUES (:id, :col_id, CAST(:vec AS vector), :doc, CAST(:meta AS jsonb))
+                        ON CONFLICT (id) DO UPDATE SET embedding = excluded.embedding, document = excluded.document, cmetadata = excluded.cmetadata
+                        """),
+                        {
+                            "id": entry["id"],
+                            "col_id": collection_id,
+                            "vec": vec_str,
+                            "doc": entry["document"],
+                            "meta": json.dumps(entry["cmetadata"]),
+                        },
+                    )
+                except Exception:
+                    await conn.execute(
+                        text("""
+                        INSERT INTO langchain_pg_embedding (id, collection_id, embedding, document, cmetadata)
+                        VALUES (:id, :col_id, CAST(:vec AS float8[]), :doc, CAST(:meta AS jsonb))
+                        ON CONFLICT (id) DO UPDATE SET embedding = excluded.embedding, document = excluded.document, cmetadata = excluded.cmetadata
+                        """),
+                        {
+                            "id": entry["id"],
+                            "col_id": collection_id,
+                            "vec": entry["embedding"],
+                            "doc": entry["document"],
+                            "meta": json.dumps(entry["cmetadata"]),
+                        },
+                    )
         logger.info("Synchronized %d chunks to PostgreSQL pgvector.", len(doc_ids))
     except Exception as e:
         logger.debug("PostgreSQL storage skipped (%s). Using local embedded store.", e)
@@ -368,6 +385,11 @@ async def retrieve_relevant_chunks(
             rows = res.fetchall()
             for row in rows:
                 cmetadata, content, emb = row[1] or {}, row[2] or "", row[3]
+                if isinstance(emb, str):
+                    try:
+                        emb = [float(x.strip()) for x in emb.strip("[]").split(",") if x.strip()]
+                    except Exception:
+                        emb = []
                 if emb and len(emb) == len(q_arr):
                     c_arr = np.array(emb, dtype=np.float32)
                     c_norm = float(np.linalg.norm(c_arr)) or 1e-9
