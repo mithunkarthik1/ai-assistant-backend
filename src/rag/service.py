@@ -7,13 +7,13 @@ from typing import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.chat_bot.model import ChatMessage
-from app.chat_bot.repository import ChatMessageRepository
-from app.chat_bot.schema import ChatRequest, ChatResponse, SourceChunk
-from app.rag.chain import generate_rag_answer
-from app.rag.indexing import POLICY_FILENAME
+from src.langchain.chain import generate_rag_answer
+from src.langchain.indexing import POLICY_FILENAME
+from src.rag.model import ChatMessage
+from src.rag.repository import ChatMessageRepository
+from src.rag.schema import ChatRequest, ChatResponse, SourceChunk
 
-logger = logging.getLogger("app.chat_bot.service")
+logger = logging.getLogger("src.rag.service")
 
 
 class ChatService:
@@ -34,11 +34,10 @@ class ChatService:
         3. Persists the assistant's answer to the database.
         4. Returns the response with citations and handbook suggestions.
         """
-        # 1. Fetch recent history for multi-turn conversational context
         raw_history = request.chat_history if request.chat_history is not None else request.history
         recent_history = raw_history[-6:] if raw_history else []
 
-        # 2. Record user message in history
+        # 1. Record user message in history
         try:
             await self.chat_repo.add_message(
                 role="user",
@@ -47,7 +46,7 @@ class ChatService:
         except Exception as e:
             logger.warning("Failed to record incoming user message to database: %s", e)
 
-        # 3. Generate grounded answer via LangChain RAG Chain
+        # 2. Generate grounded answer via LangChain RAG Chain
         try:
             res = await generate_rag_answer(
                 question=request.message,
@@ -104,7 +103,7 @@ class ChatService:
                 )
             )
 
-        # 4. Record assistant response in history
+        # 3. Record assistant response in history
         try:
             await self.chat_repo.add_message(
                 role="assistant",

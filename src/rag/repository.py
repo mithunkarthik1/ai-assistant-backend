@@ -3,15 +3,13 @@ Repository for persisting and querying ChatMessage entities in PostgreSQL.
 """
 import logging
 import uuid
-from typing import Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.chat_bot.model import ChatMessage
-from app.rag.indexing import POLICY_DOC_ID
+from src.rag.model import ChatMessage, DEFAULT_DOC_ID
 
-logger = logging.getLogger("app.chat_bot.repository")
+logger = logging.getLogger("src.rag.repository")
 
 
 class ChatMessageRepository:
@@ -33,7 +31,7 @@ class ChatMessageRepository:
         """
         try:
             msg = ChatMessage(
-                document_id=document_id or POLICY_DOC_ID,
+                document_id=document_id or DEFAULT_DOC_ID,
                 role=role,
                 content=content,
             )
@@ -52,10 +50,10 @@ class ChatMessageRepository:
         limit: int = 50,
     ) -> list[ChatMessage]:
         """
-        Fetches the recent message history for a given document in chronological order.
+        Fetches recent message history for a given document in chronological order.
         """
         try:
-            doc_id = document_id or POLICY_DOC_ID
+            doc_id = document_id or DEFAULT_DOC_ID
             stmt = (
                 select(ChatMessage)
                 .where(ChatMessage.document_id == doc_id)
@@ -64,7 +62,6 @@ class ChatMessageRepository:
             )
             result = await self.session.execute(stmt)
             messages = list(result.scalars().all())
-            # Return in chronological order (oldest first)
             messages.reverse()
             return messages
         except Exception as e:

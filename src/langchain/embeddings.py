@@ -8,9 +8,9 @@ from typing import List
 from langchain_core.embeddings import Embeddings
 from langchain_openai import OpenAIEmbeddings
 
-from app.config import settings
+from src.config import settings
 
-logger = logging.getLogger("rag.embeddings")
+logger = logging.getLogger("src.langchain.embeddings")
 
 _cached_fastembed = None
 
@@ -72,7 +72,6 @@ def get_embedding_model(
             model=model or settings.embedding_model or "text-embedding-3-small",
         )
 
-    # Local FastEmbed for 100% free dense semantic search
     model_name = model or settings.embedding_model or "BAAI/bge-small-en-v1.5"
     if "text-embedding" in model_name:
         model_name = "BAAI/bge-small-en-v1.5"

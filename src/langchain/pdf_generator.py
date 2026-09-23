@@ -5,7 +5,7 @@ with structured 5-page layout, headers, page numbers, and corporate styling.
 import logging
 from pathlib import Path
 
-logger = logging.getLogger("rag.pdf_generator")
+logger = logging.getLogger("src.langchain.pdf_generator")
 
 
 POLICY_PAGES = [
@@ -58,8 +58,7 @@ POLICY_PAGES = [
                     "Daily Meal Allowance: Capped at $75 per day without alcohol during official business travel.",
                     "Flight Booking Policy: Domestic flights under 5 hours must be booked in Economy Class; flights over 5 hours or international flights qualify for Premium Economy.",
                     "Hotel Accommodation Limit: Reimbursable up to $180 per night in tier-1 cities and $120 per night in other locations.",
-                    "Expense Submission Window: Expense claims along with valid itemized tax receipts must be submitted via the finance portal within 30 days of incurring the expense.",
-                    "Late Expense Claims: Claims submitted after 30 days are subject to rejection."
+                    "Expense Submission Deadline: All expense reports and receipts must be submitted within 30 days of expense incurrence via the employee portal."
                 ]
             }
         ]
@@ -69,25 +68,24 @@ POLICY_PAGES = [
         "sections": [
             {
                 "num": "5",
-                "title": "IT Equipment and Hardware Policy",
-                "intro": "The company provides each full-time employee with enterprise-grade hardware to perform their duties.",
+                "title": "Health Insurance and Wellness Benefits",
+                "intro": "Comprehensive group health insurance is provided to all full-time permanent employees effective from day one of employment.",
                 "bullets": [
-                    "Standard Engineering Laptops: Apple MacBook Pro 16-inch (M3/M4) or Dell XPS 15 laptop with 32GB RAM.",
-                    "Hardware Accessories Provided: External 27-inch 4K monitor, wireless keyboard, mouse, and noise-canceling headset.",
-                    "Hardware Refresh Cycle: Occurs every 3 years.",
-                    "Asset Ownership and Return: All hardware remains company property and must be returned to IT Support upon termination or resignation."
+                    "Coverage: Medical, surgical, and hospitalization coverage up to $50,000 per policy year.",
+                    "Dependents: Policy covers the employee, spouse, and up to two dependent children.",
+                    "Dental and Vision: An annual benefit of $500 per covered member is provided for preventive dental checkups, cleaning, and corrective eyewear.",
+                    "Mental Health Support: Up to 8 confidential sessions per year with licensed counselors through our Employee Assistance Program (EAP).",
+                    "Wellness Stipend: $50 per month toward gym memberships, yoga classes, or fitness subscriptions."
                 ]
             },
             {
                 "num": "6",
-                "title": "Information Security and Password Policy",
-                "intro": "Information security is mandatory for all employees to safeguard client data and intellectual property.",
+                "title": "Code of Conduct and Anti-Harassment",
+                "intro": "WorkPilot is committed to providing a safe, inclusive, and harassment-free workplace for everyone.",
                 "bullets": [
-                    "Password Complexity Requirement: Passwords must be at least 12 characters in length, containing uppercase letters, lowercase letters, numbers, and at least one special symbol.",
-                    "Multi-Factor Authentication (MFA): Strictly mandatory on all company accounts, Google Workspace, and GitHub.",
-                    "Password Expiry and Rotation: Passwords must be updated every 90 days and cannot match the previous 5 passwords.",
-                    "Auto-Lock Policy: Company devices must never be left unattended in public places and screens must auto-lock after 5 minutes of inactivity.",
-                    "VPN Requirement: Connection to company networks from public Wi-Fi requires active connection through the official company WireGuard VPN."
+                    "Zero Tolerance: Harassment, discrimination, or bullying based on race, gender, religion, sexual orientation, disability, or age will result in immediate disciplinary action up to termination.",
+                    "Reporting: Incidents can be reported directly to People Operations, a designated HR partner, or anonymously via our confidential whistle-blower helpline.",
+                    "Non-Retaliation: Retaliation against any employee reporting a violation in good faith is strictly prohibited."
                 ]
             }
         ]
@@ -97,24 +95,24 @@ POLICY_PAGES = [
         "sections": [
             {
                 "num": "7",
-                "title": "Employee Benefits and Group Health Insurance",
-                "intro": "The company offers comprehensive health and wellness coverage for full-time employees and their immediate families.",
+                "title": "Device Security, Data Protection, and Acceptable Use",
+                "intro": "All company-provided laptops and equipment are monitored for security compliance.",
                 "bullets": [
-                    "Group Health Insurance Coverage: Provides up to $50,000 annual inpatient hospitalization coverage covering employee, spouse, and up to two dependent children.",
-                    "Annual Health Checkup: Free vouchers provided annually to all employees and spouses.",
-                    "Dental and Vision Benefits: Covered up to $1,000 annually per employee.",
-                    "Mental Health & Wellness: 12 free confidential therapy and counseling sessions per year via our Employee Assistance Program (EAP).",
-                    "Gym and Fitness Reimbursement: Offers up to $60 per month towards gym memberships, yoga classes, or sports subscriptions."
+                    "Multi-Factor Authentication (MFA): Mandatory for all company accounts, SSO, VPN, and email access.",
+                    "Password Policy: Minimum 12 characters with a mix of uppercase, lowercase, numbers, and symbols, rotated every 90 days.",
+                    "Data Classification: Customer data and source code are classified as Confidential and must never be copied to personal devices, USB drives, or unapproved cloud storage.",
+                    "Incident Reporting: Lost or stolen laptops must be reported to the IT Security Team within 2 hours of discovery for immediate remote wipe."
                 ]
             },
             {
                 "num": "8",
-                "title": "Code of Conduct and Anti-Harassment (POSH)",
-                "intro": "WorkPilot enforces a zero-tolerance policy against any form of discrimination, harassment, or retaliation.",
+                "title": "Performance Reviews, Promotions, and Appraisals",
+                "intro": "Performance appraisals follow a structured bi-annual review cycle in June and December.",
                 "bullets": [
-                    "POSH Compliance: The company complies strictly with the Prevention of Sexual Harassment (POSH) framework.",
-                    "Incident Reporting: Any observed or experienced harassment must be reported directly to the Internal Complaints Committee (ICC) or anonymously via ethics@workpilot.internal.",
-                    "Anti-Retaliation Policy: Retaliation against anyone filing a complaint or participating in an investigation results in immediate termination."
+                    "Self-evaluation followed by 360-degree peer feedback and manager review.",
+                    "Performance ratings range from 1 (Needs Improvement) to 5 (Exceeds Expectations).",
+                    "Promotion Eligibility: Requires minimum 12 months in current role and sustained rating of 4 or above in the previous two evaluation cycles.",
+                    "Annual Merit Increases: Effective annually on April 1 based on overall company performance and individual ratings."
                 ]
             }
         ]
@@ -124,22 +122,23 @@ POLICY_PAGES = [
         "sections": [
             {
                 "num": "9",
-                "title": "Performance Appraisal and Promotion Policy",
-                "intro": "Performance evaluations are conducted twice per year to foster professional growth.",
+                "title": "Learning, Development, and Certifications",
+                "intro": "Continuous learning and professional growth are core values at WorkPilot.",
                 "bullets": [
-                    "Appraisal Cycles: Review cycles occur bi-annually in April (mid-year review) and October (annual performance & compensation appraisal).",
-                    "Rating Framework: Performance is rated on a 5-point scale across technical delivery, ownership, teamwork, and leadership principles.",
-                    "Salary Increments and Promotions: Finalized in November following the October appraisal cycle."
+                    "Annual Learning Budget: $1,200 per full-time employee per calendar year for courses, books, workshops, and conferences.",
+                    "Professional Certifications: Examination fees for relevant technical or domain certifications are 100% reimbursed upon passing.",
+                    "Study Leave: Up to 3 days of paid study leave per year for approved certification examinations."
                 ]
             },
             {
                 "num": "10",
-                "title": "Resignation and Notice Period Protocol",
-                "intro": "The standard notice period for full-time confirmed employees is 60 calendar days.",
+                "title": "Separation, Resignation, and Exit Process",
+                "intro": "Guidelines for a smooth offboarding process when an employee leaves the company.",
                 "bullets": [
-                    "Probationary employees have a notice period of 30 calendar days.",
-                    "Buyout of notice period requires mutual written consent between the employee and department head.",
-                    "Final settlement (Full & Final / F&F) including accrued salary, gratuity, and leave encashment is disbursed within 45 days of the last working day."
+                    "Notice Period: Standard notice period is 30 days for individual contributors and 60 days for lead and managerial roles.",
+                    "Notice Buyout: Permissible only with written approval from the Department Head and People Operations.",
+                    "Asset Return: All company property including laptops, monitors, access cards, and company credit cards must be returned by the last working day.",
+                    "Full and Final Settlement: Processed within 30 days of the last working day, including encashment of eligible unused PTO days."
                 ]
             }
         ]
@@ -147,29 +146,33 @@ POLICY_PAGES = [
 ]
 
 
-def generate_company_policy_pdf(output_path: Path | str | None = None) -> Path:
-    """Generates a 5-page official WorkPilot Company Policy Handbook PDF."""
-    if output_path is None:
+def generate_company_policy_pdf(target_path: Path | str | None = None) -> Path:
+    """
+    Generates an official enterprise-grade WorkPilot Company Policy Handbook PDF
+    with structured 5-page layout, headers, page numbers, and corporate styling.
+    """
+    if target_path is None:
         target_path = Path(__file__).resolve().parent.parent.parent / "data" / "WorkPilot_Company_Policy.pdf"
     else:
-        target_path = Path(output_path)
+        target_path = Path(target_path)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        from reportlab.lib.pagesizes import letter
         from reportlab.lib import colors
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, HRFlowable
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.platypus import HRFlowable, PageBreak, Paragraph, SimpleDocTemplate, Spacer
     except ImportError:
-        logger.warning("reportlab is not installed; returning target_path if it exists.")
+        logger.warning("ReportLab is not installed; writing fallback text-based PDF placeholder")
+        target_path.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\nxref\n0 3\n0000000000 65535 f\n0000000009 00000 n\n0000000052 00000 n\ntrailer<</Size 3/Root 1 0 R>>\nstartxref\n108\n%%EOF\n")
         return target_path
 
     doc = SimpleDocTemplate(
         str(target_path),
         pagesize=letter,
-        leftMargin=46,
-        rightMargin=46,
+        rightMargin=45,
+        leftMargin=45,
         topMargin=40,
         bottomMargin=40,
     )
@@ -181,19 +184,19 @@ def generate_company_policy_pdf(output_path: Path | str | None = None) -> Path:
         parent=styles["Heading1"],
         fontName="Helvetica-Bold",
         fontSize=15,
-        leading=18,
+        leading=19,
         textColor=colors.HexColor("#0F172A"),
-        spaceAfter=4,
+        spaceAfter=2,
     )
 
     doc_sub_style = ParagraphStyle(
         "DocSub",
         parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9,
-        leading=12,
-        textColor=colors.HexColor("#64748B"),
-        spaceAfter=8,
+        fontName="Helvetica-Bold",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#2563EB"),
+        spaceAfter=6,
     )
 
     sec_title_style = ParagraphStyle(
@@ -256,7 +259,6 @@ def generate_company_policy_pdf(output_path: Path | str | None = None) -> Path:
                 story.append(Paragraph(sec["intro"], intro_style))
 
             for bullet in sec.get("bullets", []):
-                # Clean and format bold labels
                 if ":" in bullet:
                     parts = bullet.split(":", 1)
                     bullet_text = f"• <b>{parts[0].strip()}:</b> {parts[1].strip()}"

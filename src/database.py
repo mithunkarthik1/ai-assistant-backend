@@ -1,6 +1,7 @@
 """
 Database connection and session management module.
 Initializes the async SQLAlchemy engine, session maker, and database tables.
+Supports resilient fallback if PostgreSQL is not running locally.
 """
 import logging
 from collections.abc import AsyncIterator
@@ -9,9 +10,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-from app.core.config import settings
+from src.config import settings
 
-logger = logging.getLogger("app.core.database")
+logger = logging.getLogger("src.database")
 
 
 class Base(DeclarativeBase):
@@ -37,7 +38,7 @@ async def init_db() -> None:
     Initializes database schema, creates the vector extension if supported,
     and sets up langchain_pg_embedding tables.
     """
-    from app.chat_bot.model import ChatMessage  # noqa: F401
+    from src.rag.model import ChatMessage  # noqa: F401
 
     # 1. Attempt to enable vector extension if available
     try:
@@ -50,7 +51,7 @@ async def init_db() -> None:
                 await conn.rollback()
                 logger.debug("vector extension not enabled or not needed: %s", e)
     except Exception as e:
-        logger.warning("Could not connect to database for extension setup: %s", e)
+        logger.warning("Database connection unavailable during extension setup: %s", e)
 
     # 2. Create application tables and embedding tables
     try:
@@ -74,8 +75,7 @@ async def init_db() -> None:
             """))
         logger.info("Application and embedding tables initialized successfully.")
     except Exception as e:
-        logger.error("Failed to initialize database tables: %s", e, exc_info=True)
-        raise
+        logger.warning("Could not initialize PostgreSQL tables: %s (Running in local mode)", e)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

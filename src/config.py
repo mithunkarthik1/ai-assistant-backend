@@ -15,13 +15,15 @@ class Settings(BaseSettings):
     chunk_size: int = 1000
     chunk_overlap: int = 200
     top_k: int = 6
+    log_level: str = "INFO"
+    cors_origins: str = "*"
 
-    # LLM Settings (OpenAI, Groq, xAI Grok, Ollama, OpenRouter)
+    # LLM Settings (Groq, OpenAI, xAI Grok, Ollama, OpenRouter)
     llm_api_key: str | None = None
     llm_model: str = "openai/gpt-oss-20b"
     llm_base_url: str | None = None
 
-    # Embeddings Settings
+    # Embeddings & Vector Settings
     embedding_provider: str = "fastembed"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     min_similarity: float = 0.50

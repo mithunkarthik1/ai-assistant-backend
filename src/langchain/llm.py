@@ -1,10 +1,14 @@
+"""
+LLM factory module.
+Initializes OpenAI-compatible Chat models (Groq, OpenAI, xAI Grok, Ollama, OpenRouter).
+"""
 import logging
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
-from app.config import settings
+from src.config import settings
 
-logger = logging.getLogger("rag.llm")
+logger = logging.getLogger("src.langchain.llm")
 
 
 def get_llm(
@@ -16,7 +20,8 @@ def get_llm(
     fake_response: str | None = None,
 ) -> BaseChatModel | None:
     """
-    Returns an OpenAI-compatible Chat model instance (Groq, OpenAI, xAI Grok, Ollama, OpenRouter).
+    Returns an OpenAI-compatible Chat model instance.
+    Supports Groq, OpenAI, xAI Grok, Ollama, OpenRouter.
     Configured with zero-temperature for strict anti-hallucination factual grounding.
     """
     key = api_key or settings.llm_api_key or ""
@@ -27,7 +32,7 @@ def get_llm(
     if key.startswith("gsk_") or (b_url and "groq.com" in b_url):
         b_url = b_url or "https://api.groq.com/openai/v1"
         if not model_name or "llama-3.3-70b-versatile" in model_name:
-            model_name = "openai/gpt-oss-120b"
+            model_name = "openai/gpt-oss-20b"
         logger.info("Initializing Groq LLM (model=%s, base_url=%s)", model_name, b_url)
 
     # 2. xAI (Grok)

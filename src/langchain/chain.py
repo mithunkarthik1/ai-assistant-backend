@@ -1,17 +1,22 @@
+"""
+LangChain RAG Chain execution module.
+Coordinates context retrieval, prompt formatting, and LLM answer generation.
+"""
 import logging
 import uuid
 from typing import Any, Sequence
+
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 
-from app.config import settings
-from app.rag.indexing import POLICY_DOC_ID, POLICY_FILENAME
-from app.rag.llm import get_llm
-from app.rag.prompts import get_general_prompt_template, get_rag_prompt_template
-from app.rag.retriever import retrieve_relevant_chunks
+from src.config import settings
+from src.langchain.indexing import POLICY_DOC_ID, POLICY_FILENAME
+from src.langchain.llm import get_llm
+from src.langchain.prompts import get_general_prompt_template, get_rag_prompt_template
+from src.langchain.retriever import retrieve_relevant_chunks
 
-logger = logging.getLogger("rag.chain")
+logger = logging.getLogger("src.langchain.chain")
 
 
 class RagResult(tuple):
@@ -91,8 +96,8 @@ async def generate_rag_answer(
 ) -> RagResult:
     """
     Executes a pure, LLM-driven RAG pipeline:
-    1. Retrieves relevant policy chunks from PostgreSQL pgvector using dense vector embeddings + contextual search.
-    2. Builds the prompt with retrieved context, conversation history, and user question.
+    1. Retrieves relevant policy chunks from vector store using dense embeddings + contextual search.
+    2. Builds prompt with retrieved context, conversation history, and user question.
     3. Invokes the LLM to synthesize an accurate, grounded, and concise answer.
     4. Routes out-of-scope or ungrounded questions through the general LLM fallback chain.
     """
@@ -101,12 +106,16 @@ async def generate_rag_answer(
     output_parser = StrOutputParser()
 
     # 1. Retrieve semantically relevant policy chunks from vector store
-    chunks = await retrieve_relevant_chunks(
-        document_id=target_doc_id,
-        query=question,
-        top_k=effective_top_k,
-        chat_history=chat_history,
-    )
+    try:
+        chunks = await retrieve_relevant_chunks(
+            document_id=target_doc_id,
+            query=question,
+            top_k=effective_top_k,
+            chat_history=chat_history,
+        )
+    except Exception as e:
+        logger.error("Error during chunk retrieval: %s", e, exc_info=True)
+        chunks = []
 
     logger.info(
         "Semantic Search for '%s' retrieved %d chunks (scores: %s)",

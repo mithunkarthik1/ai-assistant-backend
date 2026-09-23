@@ -1,6 +1,7 @@
 """
 Document indexing module.
-Loads company policy text, applies text splitting, and persists dense vectors to PostgreSQL pgvector.
+Loads company policy text, splits into structured chunks, and indexes embeddings into
+PostgreSQL pgvector (if available) AND the local embedded vector store (service-free).
 """
 import logging
 import uuid
@@ -9,12 +10,12 @@ from pathlib import Path
 from langchain_core.documents import Document as LangChainDoc
 from sqlalchemy import text
 
-from app.config import settings
-from app.database import engine
-from app.rag.splitter import split_documents
-from app.rag.vectorstore import store_documents
+from src.config import settings
+from src.database import engine
+from src.langchain.splitter import split_documents
+from src.langchain.vectorstore import get_local_vector_store, store_documents
 
-logger = logging.getLogger("rag.indexing")
+logger = logging.getLogger("src.langchain.indexing")
 
 POLICY_DOC_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
 POLICY_FILENAME = "company_policy.txt"
@@ -29,11 +30,9 @@ def get_policy_file_path() -> Path:
     if raw_path.is_absolute() and raw_path.exists():
         return raw_path
 
-    # Try relative to current working directory (e.g. /app or backend/)
     if raw_path.exists():
         return raw_path
 
-    # Try relative to backend root
     backend_root = Path(__file__).resolve().parent.parent.parent
     candidate = backend_root / raw_path
     if candidate.exists():
@@ -57,9 +56,8 @@ def load_policy_content() -> str:
 
 async def index_company_policy(force_reindex: bool = False) -> int:
     """
-    Indexes the company policy text file into PostgreSQL with dense semantic vectors.
-    Automatically detects if existing embeddings are present and skips re-indexing if ready.
-    Returns the number of indexed chunks.
+    Indexes the company policy text file.
+    Persists to both PostgreSQL (if available) and local embedded store.
     """
     try:
         policy_text = load_policy_content()
@@ -67,10 +65,38 @@ async def index_company_policy(force_reindex: bool = False) -> int:
         logger.error("Failed to load policy content for indexing: %s", e)
         return 0
 
-    policy_bytes = policy_text.encode("utf-8")
-    content_size = len(policy_bytes)
+    # 1. Check if already indexed in local embedded store
+    local_chunks = get_local_vector_store()
+    if not force_reindex and len(local_chunks) >= 30:
+        logger.info("Company policy already indexed in local embedded vector store (%d chunks).", len(local_chunks))
+        # Also ensure PostgreSQL has it if connected
+        try:
+            async with engine.connect() as conn:
+                res = await conn.execute(
+                    text("SELECT count(*) FROM langchain_pg_embedding WHERE cmetadata->>'document_id' = :doc_id"),
+                    {"doc_id": str(POLICY_DOC_ID)},
+                )
+                row = res.fetchone()
+                db_count = row[0] if row else 0
+                if db_count < len(local_chunks):
+                    logger.info("Syncing %d local chunks to PostgreSQL...", len(local_chunks))
+                    raw_policy = LangChainDoc(
+                        page_content=policy_text,
+                        metadata={
+                            "document_id": str(POLICY_DOC_ID),
+                            "filename": POLICY_FILENAME,
+                            "page": 1,
+                        },
+                    )
+                    policy_chunks = split_documents([raw_policy])
+                    await store_documents(policy_chunks)
+        except Exception:
+            pass # DB service may not be running locally; that's perfectly fine
+        return len(local_chunks)
 
-    # Check existing chunks in PostgreSQL
+    # 2. Check if already indexed in PostgreSQL
+    existing_count = 0
+    vector_dim = 0
     try:
         async with engine.connect() as conn:
             res = await conn.execute(
@@ -86,29 +112,15 @@ async def index_company_policy(force_reindex: bool = False) -> int:
             existing_count = row[0] if row else 0
             vector_dim = row[1] if row else 0
     except Exception as e:
-        logger.error("Database error while checking existing embeddings: %s", e)
-        existing_count = 0
-        vector_dim = 0
+        logger.debug("Database check skipped (DB service offline or tables not ready): %s", e)
 
     if not force_reindex and existing_count >= 30 and vector_dim >= 384:
-        logger.info(
-            "Company policy already indexed with %d-d semantic vectors (%d chunks). Skipping re-indexing.",
-            vector_dim,
-            existing_count,
-        )
+        logger.info("Company policy already indexed in PostgreSQL (%d chunks).", existing_count)
         return existing_count
 
+    # 3. Perform fresh indexing
     try:
-        if existing_count > 0:
-            logger.info("Re-indexing %d existing chunks with fresh semantic vector embeddings...", existing_count)
-            async with engine.begin() as conn:
-                await conn.execute(
-                    text("DELETE FROM langchain_pg_embedding WHERE cmetadata->>'document_id' = :doc_id"),
-                    {"doc_id": str(POLICY_DOC_ID)},
-                )
-
-        logger.info("Indexing Company Policy (%d bytes) with dense semantic vectors...", content_size)
-
+        logger.info("Generating fresh embeddings for Company Policy...")
         raw_policy = LangChainDoc(
             page_content=policy_text,
             metadata={
@@ -120,7 +132,7 @@ async def index_company_policy(force_reindex: bool = False) -> int:
         policy_chunks = split_documents([raw_policy])
         if policy_chunks:
             await store_documents(policy_chunks)
-            logger.info("Successfully indexed %d policy chunks into PostgreSQL.", len(policy_chunks))
+            logger.info("Successfully indexed %d policy chunks into vector store.", len(policy_chunks))
             return len(policy_chunks)
     except Exception as e:
         logger.error("Error during policy document indexing: %s", e, exc_info=True)

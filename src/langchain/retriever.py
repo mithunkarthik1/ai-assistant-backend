@@ -1,6 +1,12 @@
 """
 Vector similarity retriever module for company policy documents.
-Performs dense vector semantic search against PostgreSQL pgvector store.
+Performs dense vector semantic search against PostgreSQL pgvector or local embedded file store.
+
+How vector search works without a database service:
+- Query is converted into a 384-dimensional dense vector using local FastEmbed (CPU ONNX runtime).
+- If PostgreSQL pgvector service is offline, candidate vectors are loaded from `data/local_vector_store.json`.
+- Dot product and cosine similarity are computed in memory using NumPy (`np.dot(q, c) / (||q|| * ||c||)`).
+- Chunks above the similarity threshold are ranked and returned to the LLM.
 """
 import logging
 import uuid
@@ -11,11 +17,12 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from sqlalchemy import text
 
-from app.config import settings
-from app.database import engine
-from app.rag.embeddings import get_embedding_model
+from src.config import settings
+from src.database import engine
+from src.langchain.embeddings import get_embedding_model
+from src.langchain.vectorstore import get_local_vector_store
 
-logger = logging.getLogger("rag.retriever")
+logger = logging.getLogger("src.langchain.retriever")
 
 
 def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -> str:
@@ -30,7 +37,6 @@ def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -
     cleaned = query.strip()
     words = cleaned.split()
 
-    # If the user query is very short or clearly an elliptical follow-up
     is_short = len(words) <= 5
     starts_with_connector = cleaned.lower().startswith(
         ("and ", "also ", "what about", "how about", "what if", "can i also", "does it", "is it")
@@ -39,7 +45,6 @@ def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -
     if not (is_short or starts_with_connector):
         return query
 
-    # Find the last user turn from recent chat history
     last_user_query = None
     for msg in reversed(chat_history):
         role = (
@@ -74,8 +79,8 @@ async def retrieve_semantic_chunks(
     chat_history: Sequence[Any] | None = None,
 ) -> list[Document]:
     """
-    Performs dense vector semantic search across PostgreSQL chunk embeddings.
-    Matches the meaning and intent of the query using cosine similarity.
+    Performs dense vector semantic search across chunk embeddings.
+    Queries PostgreSQL pgvector when available; otherwise queries the local embedded store.
     """
     threshold = min_similarity if min_similarity is not None else settings.min_similarity
     search_query = contextualize_query(query, chat_history)
@@ -91,6 +96,8 @@ async def retrieve_semantic_chunks(
         logger.error("Failed to generate query embedding: %s", e)
         return []
 
+    # 1. Attempt retrieval from PostgreSQL pgvector
+    rows = []
     try:
         async with engine.connect() as conn:
             res = await conn.execute(
@@ -103,32 +110,54 @@ async def retrieve_semantic_chunks(
             )
             rows = res.fetchall()
     except Exception as e:
-        logger.error("Database query failed while retrieving embeddings: %s", e)
-        return []
-
-    if not rows:
-        logger.warning("No embeddings found in database for document_id=%s", document_id)
-        return []
+        logger.debug("PostgreSQL query skipped (offline or not reachable): %s", e)
 
     scored_chunks: list[tuple[float, Document]] = []
-    for row in rows:
-        try:
-            cmetadata = row[1] or {}
-            content = row[2] or ""
-            emb = row[3]
 
-            if emb and len(emb) == len(q_arr):
-                chunk_arr = np.array(emb, dtype=np.float32)
-                c_norm = float(np.linalg.norm(chunk_arr))
-                sim = float(np.dot(q_arr, chunk_arr) / (q_norm * c_norm)) if c_norm > 0 else 0.0
-            else:
-                sim = 0.0
+    # 2. If PostgreSQL returned rows, score them
+    if rows:
+        for row in rows:
+            try:
+                cmetadata = row[1] or {}
+                content = row[2] or ""
+                emb = row[3]
+                if emb and len(emb) == len(q_arr):
+                    chunk_arr = np.array(emb, dtype=np.float32)
+                    c_norm = float(np.linalg.norm(chunk_arr))
+                    sim = float(np.dot(q_arr, chunk_arr) / (q_norm * c_norm)) if c_norm > 0 else 0.0
+                else:
+                    sim = 0.0
+                meta = {**cmetadata, "score": round(sim, 4)}
+                scored_chunks.append((sim, Document(page_content=content, metadata=meta)))
+            except Exception as e:
+                logger.warning("Error computing similarity for PostgreSQL chunk: %s", e)
+                continue
 
-            meta = {**cmetadata, "score": round(sim, 4)}
-            scored_chunks.append((sim, Document(page_content=content, metadata=meta)))
-        except Exception as e:
-            logger.warning("Error computing similarity for chunk: %s", e)
-            continue
+    # 3. Fallback: If no DB rows were found, use local embedded vector store (no DB service needed!)
+    if not scored_chunks:
+        local_entries = get_local_vector_store()
+        if local_entries:
+            logger.info("Using local embedded vector store (%d entries, zero DB service required).", len(local_entries))
+            for item in local_entries:
+                try:
+                    cmetadata = item.get("cmetadata", {})
+                    content = item.get("document", "")
+                    emb = item.get("embedding", [])
+                    if emb and len(emb) == len(q_arr):
+                        chunk_arr = np.array(emb, dtype=np.float32)
+                        c_norm = float(np.linalg.norm(chunk_arr))
+                        sim = float(np.dot(q_arr, chunk_arr) / (q_norm * c_norm)) if c_norm > 0 else 0.0
+                    else:
+                        sim = 0.0
+                    meta = {**cmetadata, "score": round(sim, 4)}
+                    scored_chunks.append((sim, Document(page_content=content, metadata=meta)))
+                except Exception as e:
+                    logger.warning("Error computing similarity for local chunk: %s", e)
+                    continue
+
+    if not scored_chunks:
+        logger.warning("No embeddings available in either PostgreSQL or local embedded store.")
+        return []
 
     # Sort descending by semantic similarity
     scored_chunks.sort(key=lambda x: x[0], reverse=True)
@@ -143,7 +172,6 @@ async def retrieve_semantic_chunks(
         return []
 
     top_score = scored_chunks[0][0]
-    # Dynamic relative cutoff to keep top matches closely clustered
     effective_threshold = max(threshold, top_score - 0.12)
     relevant = [doc for score, doc in scored_chunks[:top_k] if score >= effective_threshold]
 

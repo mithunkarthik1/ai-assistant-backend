@@ -10,12 +10,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.chat_bot.schema import ChatRequest, ChatResponse
-from app.chat_bot.service import ChatService
-from app.database import get_db
-from app.rag.pdf_generator import POLICY_PAGES, generate_company_policy_pdf
+from src.database import get_db
+from src.langchain.pdf_generator import POLICY_PAGES, generate_company_policy_pdf
+from src.rag.schema import ChatMessageResponse, ChatRequest, ChatResponse
+from src.rag.service import ChatService
 
-logger = logging.getLogger("app.chat_bot.api")
+logger = logging.getLogger("src.rag.api")
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
@@ -58,19 +58,21 @@ async def chat_with_policy(
 
 @router.get(
     "/history",
+    response_model=list[ChatMessageResponse],
     summary="Get recent conversation history",
 )
 @router.get(
     "/{document_id}/history",
+    response_model=list[ChatMessageResponse],
     summary="Get recent conversation history (legacy compatibility)",
     include_in_schema=False,
 )
 async def get_chat_history(
     document_id: str | None = None,
     db: AsyncSession = Depends(get_db),
-) -> Any:
+) -> list[ChatMessageResponse]:
     """
-    Retrieves the chronological message history for the active conversation.
+    Retrieves chronological message history for the active conversation.
     """
     try:
         service = ChatService(db)
