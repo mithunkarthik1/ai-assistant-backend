@@ -9,8 +9,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.config import settings
-from src.database import init_db
+from src.database import init_db, settings
 from src.rag.api import router as chat_router
 from src.rag.service import index_company_policy
 

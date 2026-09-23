@@ -1,19 +1,59 @@
 """
-Database connection and session management module.
-Initializes the async SQLAlchemy engine, session maker, and database tables.
+Database configuration, session management, and application settings module.
+Combines environment configuration (Pydantic Settings) and async SQLAlchemy infrastructure.
 Supports resilient fallback if PostgreSQL is not running locally.
 """
 import logging
 from collections.abc import AsyncIterator
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-from src.config import settings
+# ============================================================
+# 1. APPLICATION & DATABASE CONFIGURATION
+# ============================================================
 
+class Settings(BaseSettings):
+    """
+    Centralized configuration for the RAG Chatbot application.
+    Loaded automatically from .env with strongly typed defaults.
+    """
+    app_name: str = "RAG Chatbot API"
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/rag_db"
+    policy_file_path: str = "data/company_policy.txt"
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    top_k: int = 6
+    log_level: str = "INFO"
+    cors_origins: str = "*"
+
+    # LLM Settings (Groq, OpenAI, xAI Grok, Ollama, OpenRouter)
+    llm_api_key: str | None = None
+    llm_model: str = "openai/gpt-oss-20b"
+    llm_base_url: str | None = None
+
+    # Embeddings & Vector Settings
+    embedding_provider: str = "fastembed"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    min_similarity: float = 0.50
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+
+settings = Settings()
 logger = logging.getLogger("src.database")
 
+
+# ============================================================
+# 2. SQLALCHEMY ENGINE & SESSION SETUP
+# ============================================================
 
 class Base(DeclarativeBase):
     """Base class for all SQLAlchemy declarative models."""
@@ -26,6 +66,7 @@ engine = create_async_engine(
     future=True,
     pool_pre_ping=True,
 )
+
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
