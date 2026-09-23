@@ -1,0 +1,71 @@
+# WORKPILOT ENTERPRISE COMPANY POLICY & EMPLOYEE HANDBOOK
+
+## 1. Working Hours and Core Timings
+Standard working hours are Monday through Friday, 9:00 AM to 6:00 PM local time.
+- The company maintains a 40-hour work week with a mandatory 1-hour lunch break daily.
+- Core collaboration hours are 10:00 AM to 4:00 PM, during which team members must be reachable on Slack and available for scheduled meetings.
+- Flexible working hours permit employees to adjust their start time between 8:00 AM and 10:00 AM upon manager approval.
+
+## 2. Remote Work and Hybrid Guidelines
+The company operates on a flexible hybrid work model allowing up to 3 days of remote work per week.
+- Full-time remote work requires prior written approval from the Department Head and People Operations.
+- Remote employees receive a one-time home-office setup stipend of $500 to purchase ergonomic furniture and desk equipment.
+- A monthly internet and utility allowance of $50 is provided to eligible remote employees.
+- Employees working remotely must maintain a dedicated quiet workspace and stable internet connection of at least 50 Mbps.
+
+## 3. Leave Policy and Paid Time Off (PTO)
+The annual leave year runs from January 1 to December 31.
+- Paid Time Off (PTO): Full-time employees accrue 18 days of paid vacation per calendar year. Up to 5 unused PTO days can be carried forward to the following year.
+- Sick and Casual Leave: Employees are entitled to 12 days of paid sick and casual leave annually. Medical certificates are required for sick leave extending beyond 3 consecutive days.
+- Maternity Leave: Female employees are entitled to 26 weeks of fully paid maternity leave for up to two surviving children.
+- Paternity Leave: Male employees and non-birthing partners are entitled to 4 weeks of fully paid parental leave to be taken within the first 6 months of childbirth or adoption.
+- Bereavement Leave: 5 consecutive paid days off are provided in the event of the loss of an immediate family member.
+
+## 4. Travel and Expense Reimbursement Policy
+Business-related expenses incurred on behalf of the company are eligible for reimbursement.
+- Daily Meal Allowance: Capped at $75 per day without alcohol during official business travel.
+- Flight Booking Policy: Domestic flights under 5 hours must be booked in Economy Class; flights over 5 hours or international flights qualify for Premium Economy.
+- Hotel Accommodation Limit: Reimbursable up to $180 per night in tier-1 cities and $120 per night in other locations.
+- Expense Submission Window: Expense claims along with valid itemized tax receipts must be submitted via the finance portal within 30 days of incurring the expense.
+- Late Expense Claims: Claims submitted after 30 days are subject to rejection.
+
+## 5. IT Equipment and Hardware Policy
+The company provides each full-time employee with enterprise-grade hardware to perform their duties.
+- Standard Engineering Laptops: Apple MacBook Pro 16-inch (M3/M4) or Dell XPS 15 laptop with 32GB RAM.
+- Hardware Accessories Provided: External 27-inch 4K monitor, wireless keyboard, mouse, and noise-canceling headset.
+- Hardware Refresh Cycle: Occurs every 3 years.
+- Asset Ownership and Return: All hardware remains company property and must be returned to IT Support upon termination or resignation.
+
+## 6. Information Security and Password Policy
+Information security is mandatory for all employees to safeguard client data and intellectual property.
+- Password Complexity Requirement: Passwords must be at least 12 characters in length, containing uppercase letters, lowercase letters, numbers, and at least one special symbol.
+- Multi-Factor Authentication (MFA): Strictly mandatory on all company accounts, Google Workspace, and GitHub.
+- Password Expiry and Rotation: Passwords must be updated every 90 days and cannot match the previous 5 passwords.
+- Auto-Lock Policy: Company devices must never be left unattended in public places and screens must auto-lock after 5 minutes of inactivity.
+- VPN Requirement: Connection to company networks from public Wi-Fi requires active connection through the official company WireGuard VPN.
+
+## 7. Employee Benefits and Group Health Insurance
+The company offers comprehensive health and wellness coverage for full-time employees and their immediate families.
+- Group Health Insurance Coverage: Provides up to $50,000 annual inpatient hospitalization coverage covering employee, spouse, and up to two dependent children.
+- Annual Health Checkup: Free vouchers provided annually to all employees and spouses.
+- Dental and Vision Benefits: Covered up to $1,000 annually per employee.
+- Mental Health & Wellness: 12 free confidential therapy and counseling sessions per year via our Employee Assistance Program (EAP).
+- Gym and Fitness Reimbursement: Offers up to $60 per month towards gym memberships, yoga classes, or sports subscriptions.
+
+## 8. Code of Conduct and Anti-Harassment (POSH)
+WorkPilot enforces a zero-tolerance policy against any form of discrimination, harassment, or retaliation.
+- POSH Compliance: The company complies strictly with the Prevention of Sexual Harassment (POSH) framework.
+- Incident Reporting: Any observed or experienced harassment must be reported directly to the Internal Complaints Committee (ICC) or anonymously via ethics@workpilot.internal.
+- Anti-Retaliation Policy: Retaliation against anyone filing a complaint or participating in an investigation results in immediate termination.
+
+## 9. Performance Appraisal and Promotion Policy
+Performance evaluations are conducted twice per year to foster professional growth.
+- Appraisal Cycles: Review cycles occur bi-annually in April (mid-year review) and October (annual performance & compensation appraisal).
+- Rating Framework: Performance is rated on a 5-point scale across technical delivery, ownership, teamwork, and leadership principles.
+- Salary Increments and Promotions: Finalized in November following the October appraisal cycle.
+
+## 10. Resignation and Notice Period Protocol
+The standard notice period for full-time confirmed employees is 60 calendar days.
+- Probationary employees have a notice period of 30 calendar days.
+- Buyout of notice period requires mutual written consent between the employee and department head.
+- Final settlement (Full & Final / F&F) including accrued salary, gratuity, and leave encashment is disbursed within 45 days of the last working day.
