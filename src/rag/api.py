@@ -11,9 +11,8 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import get_db
-from src.langchain.pdf_generator import POLICY_PAGES, generate_company_policy_pdf
 from src.rag.schema import ChatMessageResponse, ChatRequest, ChatResponse
-from src.rag.service import ChatService
+from src.rag.service import ChatService, POLICY_PAGES, generate_company_policy_pdf
 
 logger = logging.getLogger("src.rag.api")
 router = APIRouter(prefix="/chat", tags=["chat"])

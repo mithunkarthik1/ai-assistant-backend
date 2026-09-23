@@ -11,8 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
 from src.database import init_db
-from src.langchain.indexing import index_company_policy
 from src.rag.api import router as chat_router
+from src.rag.service import index_company_policy
 
 # Setup root logger
 logging.basicConfig(
@@ -67,8 +67,6 @@ app.add_middleware(
 )
 
 
-@app.get("/health", tags=["system"])
-@app.get("/api/health", tags=["system"], include_in_schema=False)
 @app.get("/api/v1/health", tags=["system"], include_in_schema=False)
 async def health_check() -> dict[str, str]:
     """Health check endpoint to verify backend service availability."""
@@ -77,5 +75,3 @@ async def health_check() -> dict[str, str]:
 
 # Include RAG router at /api/v1 (standard REST prefix), /api, and root for full frontend compatibility
 app.include_router(chat_router, prefix="/api/v1")
-app.include_router(chat_router, prefix="/api", include_in_schema=False)
-app.include_router(chat_router, include_in_schema=False)

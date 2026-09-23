@@ -5,8 +5,7 @@ with structured 5-page layout, headers, page numbers, and corporate styling.
 import logging
 from pathlib import Path
 
-logger = logging.getLogger("src.langchain.pdf_generator")
-
+logger = logging.getLogger("src.rag.pdf")
 
 POLICY_PAGES = [
     {
@@ -278,8 +277,3 @@ def generate_company_policy_pdf(target_path: Path | str | None = None) -> Path:
 
     doc.build(story)
     return target_path
-
-
-if __name__ == "__main__":
-    generated = generate_company_policy_pdf()
-    print(f"Generated PDF at: {generated}")
