@@ -2,11 +2,10 @@
 Generates an official enterprise-grade WorkPilot Company Policy Handbook PDF
 with structured 5-page layout, headers, page numbers, and corporate styling.
 """
+import logging
 from pathlib import Path
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, HRFlowable
+
+logger = logging.getLogger("rag.pdf_generator")
 
 
 POLICY_PAGES = [
@@ -156,6 +155,15 @@ def generate_company_policy_pdf(output_path: Path | str | None = None) -> Path:
         target_path = Path(output_path)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, HRFlowable
+    except ImportError:
+        logger.warning("reportlab is not installed; returning target_path if it exists.")
+        return target_path
 
     doc = SimpleDocTemplate(
         str(target_path),

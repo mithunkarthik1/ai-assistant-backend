@@ -1,5 +1,10 @@
+"""
+Embeddings factory module for dense semantic vector representations.
+Supports local CPU-optimized FastEmbed (BAAI/bge-small-en-v1.5) and OpenAIEmbeddings.
+"""
 import logging
 from typing import List
+
 from langchain_core.embeddings import Embeddings
 from langchain_openai import OpenAIEmbeddings
 
@@ -19,20 +24,32 @@ class FastEmbedEmbeddings(Embeddings):
     def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5") -> None:
         global _cached_fastembed
         if _cached_fastembed is None:
-            from fastembed import TextEmbedding
-            logger.info("Initializing FastEmbed semantic model: %s", model_name)
-            _cached_fastembed = TextEmbedding(model_name=model_name)
+            try:
+                from fastembed import TextEmbedding
+                logger.info("Initializing FastEmbed semantic model: %s", model_name)
+                _cached_fastembed = TextEmbedding(model_name=model_name)
+            except ImportError as e:
+                logger.error("FastEmbed library not available: %s", e)
+                raise
         self.model = _cached_fastembed
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
-        embeddings = list(self.model.embed(texts))
-        return [e.tolist() for e in embeddings]
+        try:
+            embeddings = list(self.model.embed(texts))
+            return [e.tolist() for e in embeddings]
+        except Exception as e:
+            logger.error("Error generating document embeddings: %s", e)
+            raise
 
     def embed_query(self, text: str) -> List[float]:
-        embeddings = list(self.model.embed([text]))
-        return embeddings[0].tolist()
+        try:
+            embeddings = list(self.model.embed([text]))
+            return embeddings[0].tolist()
+        except Exception as e:
+            logger.error("Error generating query embedding for text: '%s': %s", text, e)
+            raise
 
 
 def get_embedding_model(
@@ -49,6 +66,7 @@ def get_embedding_model(
     key = api_key or settings.llm_api_key
 
     if prov == "openai" and key:
+        logger.info("Using OpenAIEmbeddings (model=%s)", model or settings.embedding_model or "text-embedding-3-small")
         return OpenAIEmbeddings(
             api_key=key,
             model=model or settings.embedding_model or "text-embedding-3-small",
@@ -58,4 +76,5 @@ def get_embedding_model(
     model_name = model or settings.embedding_model or "BAAI/bge-small-en-v1.5"
     if "text-embedding" in model_name:
         model_name = "BAAI/bge-small-en-v1.5"
+
     return FastEmbedEmbeddings(model_name=model_name)
