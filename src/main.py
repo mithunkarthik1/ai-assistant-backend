@@ -69,11 +69,13 @@ app.add_middleware(
 
 @app.get("/health", tags=["system"])
 @app.get("/api/health", tags=["system"], include_in_schema=False)
+@app.get("/api/v1/health", tags=["system"], include_in_schema=False)
 async def health_check() -> dict[str, str]:
     """Health check endpoint to verify backend service availability."""
     return {"status": "ok", "app": settings.app_name}
 
 
-# Include RAG router at both root and /api for full frontend & proxy compatibility
-app.include_router(chat_router)
+# Include RAG router at /api/v1 (standard REST prefix), /api, and root for full frontend compatibility
+app.include_router(chat_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api", include_in_schema=False)
+app.include_router(chat_router, include_in_schema=False)
