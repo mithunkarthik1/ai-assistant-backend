@@ -1,16 +1,17 @@
 """
 Service layer orchestrating chat history persistence, RAG pipeline execution,
-and response structuring.
+and response structuring. Database operations are handled directly within this service.
 """
 import logging
+import uuid
 from typing import Sequence
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.langchain.chain import generate_rag_answer
 from src.langchain.indexing import POLICY_FILENAME
-from src.rag.model import ChatMessage
-from src.rag.repository import ChatMessageRepository
+from src.rag.model import ChatMessage, DEFAULT_DOC_ID
 from src.rag.schema import ChatRequest, ChatResponse, SourceChunk
 
 logger = logging.getLogger("src.rag.service")
@@ -24,7 +25,54 @@ class ChatService:
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
-        self.chat_repo = ChatMessageRepository(session)
+
+    async def add_message(
+        self,
+        role: str,
+        content: str,
+        document_id: uuid.UUID | None = None,
+    ) -> ChatMessage:
+        """
+        Inserts and commits a new chat message into the database.
+        """
+        try:
+            msg = ChatMessage(
+                document_id=document_id or DEFAULT_DOC_ID,
+                role=role,
+                content=content,
+            )
+            self.session.add(msg)
+            await self.session.commit()
+            await self.session.refresh(msg)
+            return msg
+        except Exception as e:
+            await self.session.rollback()
+            logger.error("Failed to commit chat message to database: %s", e, exc_info=True)
+            raise
+
+    async def get_history(
+        self,
+        document_id: uuid.UUID | None = None,
+        limit: int = 50,
+    ) -> Sequence[ChatMessage]:
+        """
+        Fetches recent message history for a given document in chronological order.
+        """
+        try:
+            doc_id = document_id or DEFAULT_DOC_ID
+            stmt = (
+                select(ChatMessage)
+                .where(ChatMessage.document_id == doc_id)
+                .order_by(ChatMessage.created_at.desc())
+                .limit(limit)
+            )
+            result = await self.session.execute(stmt)
+            messages = list(result.scalars().all())
+            messages.reverse()
+            return messages
+        except Exception as e:
+            logger.error("Failed to fetch chat history from database: %s", e, exc_info=True)
+            return []
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         """
@@ -39,7 +87,7 @@ class ChatService:
 
         # 1. Record user message in history
         try:
-            await self.chat_repo.add_message(
+            await self.add_message(
                 role="user",
                 content=request.message,
             )
@@ -105,7 +153,7 @@ class ChatService:
 
         # 3. Record assistant response in history
         try:
-            await self.chat_repo.add_message(
+            await self.add_message(
                 role="assistant",
                 content=answer,
             )
@@ -118,13 +166,3 @@ class ChatService:
             session_id=request.session_id,
             show_pdf=show_pdf,
         )
-
-    async def get_history(self, limit: int = 50) -> Sequence[ChatMessage]:
-        """
-        Retrieves recent conversation history from the repository.
-        """
-        try:
-            return await self.chat_repo.get_history(limit=limit)
-        except Exception as e:
-            logger.error("Error retrieving chat history: %s", e, exc_info=True)
-            return []
