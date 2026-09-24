@@ -1,11 +1,16 @@
+"""
+SQLAlchemy ORM model for persisting conversation messages.
+"""
 import uuid
 from datetime import datetime, timezone
+
 from sqlalchemy import DateTime, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.database import Base
-from app.rag.indexing import POLICY_DOC_ID
+from src.database import Base
+
+DEFAULT_DOC_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
 
 
 class ChatMessage(Base):
@@ -20,7 +25,7 @@ class ChatMessage(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         nullable=True,
-        default=POLICY_DOC_ID,
+        default=DEFAULT_DOC_ID,
         index=True,
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False)  # "user" or "assistant"

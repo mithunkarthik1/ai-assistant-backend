@@ -1,3 +1,6 @@
+"""
+Pydantic schemas for chat requests and responses.
+"""
 import uuid
 from typing import Any
 from pydantic import BaseModel, Field
@@ -27,4 +30,6 @@ class ChatMessageResponse(BaseModel):
     id: uuid.UUID
     role: str
     content: str
-    created_at: str | None = None
+    created_at: Any = None
+
+    model_config = {"from_attributes": True}
