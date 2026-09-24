@@ -17,6 +17,25 @@ services:
       timeout: 3s
       retries: 5
 
+  # Development-only Project API. Replace this service with the real Project
+  # API before production use.
+  project-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mock_project_api
+    restart: unless-stopped
+    command: ["uvicorn", "src.project_api_mock.main:app", "--host", "0.0.0.0", "--port", "9000"]
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./src:/app/src
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/projects/PROJ-123"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
   backend:
     build:
       context: .
@@ -29,8 +48,12 @@ services:
       - .env
     environment:
       - DATABASE_URL=postgresql+psycopg://postgres:password123@db:5432/rag_db
+      - PROJECT_API_BASE_URL=http://project-api:9000
+      - PROJECT_API_PATH_PREFIX=/api/v1/projects
     depends_on:
       db:
+        condition: service_healthy
+      project-api:
         condition: service_healthy
     volumes:
       - ./data:/app/data

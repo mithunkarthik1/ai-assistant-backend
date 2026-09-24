@@ -1,0 +1,2 @@
+"""Agentic project assistant module."""
+

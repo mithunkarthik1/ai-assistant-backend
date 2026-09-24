@@ -9,7 +9,10 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.database import init_db, settings
+from src.agents.api import router as agents_router
+from src.assistant.api import router as assistant_router
+from src.core.config import settings
+from src.database.connection import init_db
 from src.rag.api import router as chat_router
 from src.rag.service import index_company_policy
 
@@ -74,3 +77,6 @@ async def health_check() -> dict[str, str]:
 
 # Include RAG router at /api/v1 (standard REST prefix), /api, and root for full frontend compatibility
 app.include_router(chat_router, prefix="/api/v1")
+# Separate agentic workflow; the existing chat/RAG router remains unchanged.
+app.include_router(agents_router, prefix="/api/v1")
+app.include_router(assistant_router, prefix="/api/v1")

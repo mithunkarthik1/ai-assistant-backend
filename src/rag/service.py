@@ -22,7 +22,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.database import engine, settings
+from src.core.config import settings
+from src.database.connection import engine
 from src.rag.model import ChatMessage, DEFAULT_DOC_ID
 from src.rag.schema import ChatRequest, ChatResponse, SourceChunk
 
