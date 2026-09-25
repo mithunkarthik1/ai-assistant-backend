@@ -8,7 +8,7 @@ from sqlalchemy import DateTime, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.database import Base
+from src.database.connection import Base
 
 DEFAULT_DOC_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
 

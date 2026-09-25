@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.database import get_db
+from src.database.connection import get_db
 from src.rag.schema import ChatMessageResponse, ChatRequest, ChatResponse
 from src.rag.service import ChatService, POLICY_PAGES, generate_company_policy_pdf
 
