@@ -33,7 +33,7 @@ AsyncSessionLocal = async_sessionmaker(
 
 async def init_db() -> None:
     """Initialize application and pgvector-compatible tables."""
-    from src.rag.model import ChatMessage  # noqa: F401
+    from src.rag.model import ChatMessage, Document, DocumentChunk  # noqa: F401
 
     try:
         async with engine.connect() as conn:

@@ -4,10 +4,14 @@ Contains the entire LangChain pipeline, FastEmbed embedding generation,
 dual-mode vector search (PostgreSQL pgvector + local embedded fallback),
 LLM answer synthesis, and chat persistence.
 """
+import hashlib
+import io
 import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,19 +23,440 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
 from src.database.connection import engine
-from src.rag.model import ChatMessage, DEFAULT_DOC_ID
-from src.rag.schema import ChatRequest, ChatResponse, SourceChunk
+from src.rag.model import ChatMessage, DEFAULT_DOC_ID, Document as DocumentModel, DocumentChunk
+from src.rag.schema import (
+    ChatRequest,
+    ChatResponse,
+    DocumentDetailResponse,
+    DocumentInfoResponse,
+    DocumentUploadResponse,
+    SourceChunk,
+)
 
 logger = logging.getLogger("src.rag.service")
 
 POLICY_DOC_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
-POLICY_FILENAME = "company_policy.txt"
+POLICY_FILENAME = "WorkPilot_Company_Policy.pdf"
 LOCAL_VECTOR_STORE_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "local_vector_store.json"
+COLLECTION_ID = uuid.UUID("3a896d38-6cd0-4856-834b-12e07cff388e")
+
+# ============================================================
+# 1. DOCUMENT EXTRACTION UTILITIES (PDF, DOCX, TXT)
+# ============================================================
+
+class ExtractionError(Exception):
+    """Raised when text extraction from a file fails."""
+    pass
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
+    """
+    Extracts text page-by-page from PDF bytes using pypdf.
+    Returns list of dicts: [{"page_number": 1, "text": "..."}, ...]
+    """
+    try:
+        import pypdf
+    except ImportError as e:
+        logger.error("pypdf is required for PDF extraction: %s", e)
+        raise ExtractionError("pypdf library is not installed.") from e
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception as e:
+                raise ExtractionError("Encrypted PDF could not be decrypted.") from e
+
+        pages_data: list[dict[str, Any]] = []
+        for idx, page in enumerate(reader.pages):
+            page_text = page.extract_text() or ""
+            pages_data.append({
+                "page_number": idx + 1,
+                "text": page_text,
+            })
+
+        total_extracted = sum(len(p["text"].strip()) for p in pages_data)
+        if total_extracted == 0:
+            logger.warning("PDF extracted 0 text characters across %d pages (may be scanned images).", len(pages_data))
+
+        return pages_data
+    except Exception as e:
+        logger.error("Failed to extract text from PDF: %s", e, exc_info=True)
+        raise ExtractionError(f"Failed to extract text from PDF: {str(e)}") from e
+
+
+def extract_text_from_docx(file_bytes: bytes) -> list[dict[str, Any]]:
+    """
+    Extracts text from DOCX bytes using python-docx.
+    Detects heading paragraphs to preserve document structure.
+    """
+    try:
+        import docx
+    except ImportError as e:
+        logger.error("python-docx is required for DOCX extraction: %s", e)
+        raise ExtractionError("python-docx library is not installed.") from e
+
+    try:
+        doc = docx.Document(io.BytesIO(file_bytes))
+        text_lines: list[str] = []
+
+        for para in doc.paragraphs:
+            content = para.text.strip()
+            if not content:
+                continue
+
+            style_name = getattr(para.style, "name", "").lower()
+            if "heading 1" in style_name:
+                text_lines.append(f"\n# {content}\n")
+            elif "heading 2" in style_name:
+                text_lines.append(f"\n## {content}\n")
+            elif "heading 3" in style_name:
+                text_lines.append(f"\n### {content}\n")
+            else:
+                text_lines.append(content)
+
+        # Include tables if any
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    text_lines.append(row_text)
+
+        full_text = "\n".join(text_lines)
+        return [{"page_number": 1, "text": full_text}]
+    except Exception as e:
+        logger.error("Failed to extract text from DOCX: %s", e, exc_info=True)
+        raise ExtractionError(f"Failed to extract text from DOCX: {str(e)}") from e
+
+
+def extract_text_from_txt(file_bytes: bytes) -> list[dict[str, Any]]:
+    """
+    Decodes plain text or markdown file bytes.
+    """
+    try:
+        text_content = file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text_content = file_bytes.decode("latin-1")
+        except Exception as e:
+            raise ExtractionError(f"Failed to decode text file: {str(e)}") from e
+
+    return [{"page_number": 1, "text": text_content}]
+
+
+def extract_document_pages(file_bytes: bytes, file_name: str) -> list[dict[str, Any]]:
+    """
+    Dispatches document bytes to the appropriate extractor based on file extension.
+    """
+    if not file_bytes:
+        raise ExtractionError(f"Uploaded file '{file_name}' is empty (0 bytes).")
+
+    ext = file_name.split(".")[-1].lower() if "." in file_name else ""
+
+    if ext == "pdf":
+        return extract_text_from_pdf(file_bytes)
+    elif ext in ("docx", "doc"):
+        return extract_text_from_docx(file_bytes)
+    elif ext in ("txt", "md", "markdown", "rst"):
+        return extract_text_from_txt(file_bytes)
+    else:
+        raise ExtractionError(f"Unsupported file format '.{ext}'. Supported formats: .pdf, .docx, .txt, .md")
+
+
+def extract_document_text(
+    file_bytes: bytes,
+    file_name: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str, str]:
+    """
+    Extracts pages, computes document-level SHA-256 hash, and detects file metadata.
+    Returns: (pages_data, metadata_dict, document_sha256_hash, file_type)
+    """
+    pages = extract_document_pages(file_bytes, file_name)
+    ext = file_name.split(".")[-1].lower() if "." in file_name else "pdf"
+
+    # Combine text from all pages to compute document-level SHA-256 content hash
+    full_text = "\n".join(p.get("text", "") for p in pages)
+    normalized = "\n".join(line.strip() for line in full_text.splitlines() if line.strip())
+    doc_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    metadata = {
+        "file_name": file_name,
+        "file_type": ext,
+        "page_count": len(pages),
+        "char_count": len(full_text),
+    }
+
+    return pages, metadata, doc_hash, ext
+
+
+# ============================================================
+# 2. HYBRID CHUNKING ENGINE (SECTION, TOPIC, SEMANTIC & OVERLAP)
+# ============================================================
+
+@dataclass
+class HybridChunk:
+    chunk_id: str
+    document_id: uuid.UUID
+    section: str
+    topic: str
+    chunk_index: int
+    content: str
+    content_hash: str
+    page_number: int
+    metadata: dict[str, Any]
+
+
+def slugify(text: str, max_words: int = 4) -> str:
+    """
+    Converts a heading/title into a clean, deterministic, alphanumeric slug.
+    Example: 'Leave Policy and Paid Time Off (PTO)' -> 'leave_policy_pto'
+    """
+    if not text:
+        return "general"
+
+    cleaned = re.sub(r"[^\w\s-]", " ", text.lower()).strip()
+    words = [w for w in cleaned.split() if w and w not in ("and", "or", "the", "a", "an", "of", "in", "to", "for")]
+    if not words:
+        words = cleaned.split()[:max_words]
+    else:
+        words = words[:max_words]
+
+    slug = "_".join(words)
+    return slug[:40] if slug else "general"
+
+
+def normalize_text_for_hash(text: str) -> str:
+    """
+    Normalizes chunk text for hashing so that trivial whitespace variations
+    (trailing spaces, blank lines, carriage returns) do not cause false re-embedding.
+    """
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    normalized = "\n".join(l for l in lines if l)
+    return normalized.strip()
+
+
+def calculate_content_hash(text: str) -> str:
+    """
+    Computes deterministic SHA-256 hash of the normalized chunk content.
+    """
+    normalized = normalize_text_for_hash(text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def is_heading(line: str) -> tuple[bool, int, str]:
+    """
+    Detects if a text line is a section or topic heading.
+    Returns (is_heading, heading_level, heading_title).
+    """
+    stripped = line.strip()
+    if not stripped or len(stripped) > 120:
+        return False, 0, ""
+
+    # 1. Markdown headings (#, ##, ###, ####)
+    md_match = re.match(r"^(#{1,4})\s+(.+)$", stripped)
+    if md_match:
+        level = len(md_match.group(1))
+        title = md_match.group(2).strip()
+        return True, level, title
+
+    # 2. Numbered headings (e.g. '1. Working Hours', 'Section 2: Remote Work', 'Article 3 - Leave')
+    numbered_match = re.match(r"^(?:Section\s+|Article\s+)?(\d+(?:\.\d+)*)[:.\-\s]+\s*([A-Za-z].+)$", stripped, re.IGNORECASE)
+    if numbered_match:
+        num_parts = numbered_match.group(1).split(".")
+        level = min(len(num_parts) + 1, 4)
+        title = stripped
+        return True, level, title
+
+    # 3. Standalone UPPERCASE heading (at least 3 words or 12 chars, not a sentence)
+    if stripped.isupper() and len(stripped) >= 8 and not stripped.endswith((".", ":", ";")):
+        return True, 1, stripped.title()
+
+    # 4. Heading ending with colon without terminal period and short length
+    if stripped.endswith(":") and len(stripped.split()) <= 8 and not any(p in stripped for p in [".", "?", "!"]):
+        return True, 2, stripped.rstrip(":")
+
+    return False, 0, ""
+
+
+def hybrid_chunk_pages(
+    pages_data: Sequence[dict[str, Any]],
+    document_id: uuid.UUID,
+    file_name: str,
+    target_chunk_size: int = 800,
+    small_overlap: int = 80,
+) -> list[HybridChunk]:
+    """
+    Applies the hybrid chunking pipeline across document pages:
+    1. Tracks active section & topic across pages.
+    2. Identifies clause-level items (bullet points, sub-clauses).
+    3. Breaks oversized sections semantically with small overlap.
+    4. Produces stable, deterministic chunk IDs and SHA-256 content hashes.
+    """
+    short_doc_id = str(document_id).split("-")[0]
+    hybrid_chunks: list[HybridChunk] = []
+
+    semantic_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=target_chunk_size,
+        chunk_overlap=small_overlap,
+        separators=["\n\n", "\n", ". ", "? ", "! ", "; ", " ", ""],
+        length_function=len,
+    )
+
+    current_section = "Overview"
+    current_topic = "Introduction"
+    global_chunk_idx = 0
+
+    topic_chunk_counters: dict[str, int] = {}
+
+    for page_info in pages_data:
+        page_num = page_info.get("page_number", 1)
+        raw_text = page_info.get("text", "")
+        if not raw_text.strip():
+            continue
+
+        lines = raw_text.split("\n")
+        current_block: list[str] = []
+
+        def flush_block(section_name: str, topic_name: str, page: int):
+            nonlocal global_chunk_idx
+            block_text = "\n".join(current_block).strip()
+            current_block.clear()
+            if not block_text:
+                return
+
+            sec_slug = slugify(section_name, max_words=3)
+            top_slug = slugify(topic_name, max_words=3)
+            group_key = f"{sec_slug}_{top_slug}"
+
+            if len(block_text) <= target_chunk_size + 150:
+                topic_counter = topic_chunk_counters.get(group_key, 0) + 1
+                topic_chunk_counters[group_key] = topic_counter
+
+                chunk_id = f"doc_{short_doc_id}_{sec_slug}_{top_slug}_{topic_counter:03d}"
+                c_hash = calculate_content_hash(block_text)
+
+                meta = {
+                    "document_id": str(document_id),
+                    "filename": file_name,
+                    "chunk_id": chunk_id,
+                    "section": section_name,
+                    "topic": topic_name,
+                    "chunk_index": global_chunk_idx,
+                    "page": page,
+                    "content_hash": c_hash,
+                }
+
+                hybrid_chunks.append(
+                    HybridChunk(
+                        chunk_id=chunk_id,
+                        document_id=document_id,
+                        section=section_name,
+                        topic=topic_name,
+                        chunk_index=global_chunk_idx,
+                        content=block_text,
+                        content_hash=c_hash,
+                        page_number=page,
+                        metadata=meta,
+                    )
+                )
+                global_chunk_idx += 1
+            else:
+                sub_texts = semantic_splitter.split_text(block_text)
+                for sub_t in sub_texts:
+                    sub_t_clean = sub_t.strip()
+                    if not sub_t_clean:
+                        continue
+
+                    topic_counter = topic_chunk_counters.get(group_key, 0) + 1
+                    topic_chunk_counters[group_key] = topic_counter
+
+                    chunk_id = f"doc_{short_doc_id}_{sec_slug}_{top_slug}_{topic_counter:03d}"
+                    c_hash = calculate_content_hash(sub_t_clean)
+
+                    meta = {
+                        "document_id": str(document_id),
+                        "filename": file_name,
+                        "chunk_id": chunk_id,
+                        "section": section_name,
+                        "topic": topic_name,
+                        "chunk_index": global_chunk_idx,
+                        "page": page,
+                        "content_hash": c_hash,
+                    }
+
+                    hybrid_chunks.append(
+                        HybridChunk(
+                            chunk_id=chunk_id,
+                            document_id=document_id,
+                            section=section_name,
+                            topic=topic_name,
+                            chunk_index=global_chunk_idx,
+                            content=sub_t_clean,
+                            content_hash=c_hash,
+                            page_number=page,
+                            metadata=meta,
+                        )
+                    )
+                    global_chunk_idx += 1
+
+        for line in lines:
+            trimmed = line.strip()
+            if not trimmed:
+                if current_block:
+                    current_block.append("")
+                continue
+
+            is_head, level, title = is_heading(trimmed)
+            if is_head:
+                flush_block(current_section, current_topic, page_num)
+
+                if level == 1:
+                    current_section = title
+                    current_topic = "General"
+                elif level == 2:
+                    if current_section == "Overview":
+                        current_section = title
+                        current_topic = "Details"
+                    else:
+                        current_topic = title
+                else:
+                    current_topic = title
+
+                current_block.append(trimmed)
+            else:
+                bullet_clause = re.match(r"^[-*•\d.]+\s*(?:\*\*(.+?)\*\*|([A-Za-z0-9\s/&]+):)\s*(.+)$", trimmed)
+                if bullet_clause and len(current_block) > 4:
+                    flush_block(current_section, current_topic, page_num)
+                    item_topic = bullet_clause.group(1) or bullet_clause.group(2)
+                    if item_topic and len(item_topic.split()) <= 4:
+                        current_topic = item_topic.strip()
+
+                current_block.append(trimmed)
+
+        flush_block(current_section, current_topic, page_num)
+
+    return hybrid_chunks
+
+
+def to_langchain_documents(chunks: Sequence[HybridChunk]) -> list[Document]:
+    """Converts HybridChunk objects into LangChain Document instances."""
+    return [
+        Document(
+            page_content=f"## {c.section} - {c.topic}\n{c.content}" if c.section and c.section != "Overview" else c.content,
+            metadata=c.metadata,
+        )
+        for c in chunks
+    ]
+
 
 # ============================================================
 # 1. EMBEDDING & LLM FACTORIES
@@ -106,7 +531,7 @@ def get_llm(
 
 
 # ============================================================
-# 2. DOCUMENT SPLITTING
+# 2. DOCUMENT SPLITTING (LEGACY COMPATIBILITY)
 # ============================================================
 
 def split_policy_document(text_content: str, base_metadata: dict) -> list[Document]:
@@ -133,7 +558,7 @@ def split_policy_document(text_content: str, base_metadata: dict) -> list[Docume
 
             chunk_meta = {
                 **base_metadata,
-                "filename": "WorkPilot_Company_Policy.pdf",
+                "filename": POLICY_FILENAME,
                 "section": section_title,
                 "page": page_num,
             }
@@ -200,49 +625,43 @@ def save_local_vector_store(entries: list[dict[str, Any]]) -> None:
         logger.error("Failed to save local vector store: %s", e)
 
 
-async def store_documents(documents: Sequence[Document]) -> list[str]:
-    """Stores chunks into local JSON store and syncs to PostgreSQL pgvector if reachable."""
-    if not documents:
-        return []
+async def upsert_vector_store(entries: list[dict[str, Any]]) -> None:
+    """
+    Upserts vector entries with stable chunk IDs into PostgreSQL pgvector
+    and local embedded store simultaneously.
+    """
+    if not entries:
+        return
 
-    texts = [d.page_content for d in documents]
-    vectors = embed_texts(texts)
+    # 1. Update local store
+    local_entries = get_local_vector_store()
+    entry_map = {str(e["id"]): e for e in local_entries}
+    for e in entries:
+        entry_map[str(e["id"])] = e
+    save_local_vector_store(list(entry_map.values()))
 
-    doc_ids = []
-    local_entries = []
-    for doc, vec in zip(documents, vectors):
-        chunk_id = str(uuid.uuid4())
-        doc_ids.append(chunk_id)
-        local_entries.append({
-            "id": chunk_id,
-            "document": doc.page_content,
-            "cmetadata": doc.metadata,
-            "embedding": vec,
-        })
-
-    # Always persist locally for service-free fallback
-    save_local_vector_store(local_entries)
-
-    # Attempt PostgreSQL sync
-    collection_id = uuid.UUID("3a896d38-6cd0-4856-834b-12e07cff388e")
+    # 2. Update PostgreSQL
     try:
         async with engine.begin() as conn:
             await conn.execute(
                 text("INSERT INTO langchain_pg_collection (uuid, name) VALUES (:uuid, :name) ON CONFLICT (uuid) DO NOTHING"),
-                {"uuid": collection_id, "name": "rag_documents"},
+                {"uuid": COLLECTION_ID, "name": "rag_documents"},
             )
-            for entry in local_entries:
+            for entry in entries:
                 vec_str = "[" + ",".join(str(f) for f in entry["embedding"]) + "]"
                 try:
                     await conn.execute(
                         text("""
                         INSERT INTO langchain_pg_embedding (id, collection_id, embedding, document, cmetadata)
                         VALUES (:id, :col_id, CAST(:vec AS vector), :doc, CAST(:meta AS jsonb))
-                        ON CONFLICT (id) DO UPDATE SET embedding = excluded.embedding, document = excluded.document, cmetadata = excluded.cmetadata
+                        ON CONFLICT (id) DO UPDATE SET
+                            embedding = excluded.embedding,
+                            document = excluded.document,
+                            cmetadata = excluded.cmetadata
                         """),
                         {
-                            "id": entry["id"],
-                            "col_id": collection_id,
+                            "id": str(entry["id"]),
+                            "col_id": COLLECTION_ID,
                             "vec": vec_str,
                             "doc": entry["document"],
                             "meta": json.dumps(entry["cmetadata"]),
@@ -253,20 +672,71 @@ async def store_documents(documents: Sequence[Document]) -> list[str]:
                         text("""
                         INSERT INTO langchain_pg_embedding (id, collection_id, embedding, document, cmetadata)
                         VALUES (:id, :col_id, CAST(:vec AS float8[]), :doc, CAST(:meta AS jsonb))
-                        ON CONFLICT (id) DO UPDATE SET embedding = excluded.embedding, document = excluded.document, cmetadata = excluded.cmetadata
+                        ON CONFLICT (id) DO UPDATE SET
+                            embedding = excluded.embedding,
+                            document = excluded.document,
+                            cmetadata = excluded.cmetadata
                         """),
                         {
-                            "id": entry["id"],
-                            "col_id": collection_id,
+                            "id": str(entry["id"]),
+                            "col_id": COLLECTION_ID,
                             "vec": entry["embedding"],
                             "doc": entry["document"],
                             "meta": json.dumps(entry["cmetadata"]),
                         },
                     )
-        logger.info("Synchronized %d chunks to PostgreSQL pgvector.", len(doc_ids))
+        logger.info("Upserted %d vector records to PostgreSQL pgvector.", len(entries))
     except Exception as e:
-        logger.debug("PostgreSQL storage skipped (%s). Using local embedded store.", e)
+        logger.debug("PostgreSQL vector upsert skipped (%s). Using local embedded store.", e)
 
+
+async def delete_from_vector_store(chunk_ids: Sequence[str]) -> None:
+    """
+    Deletes specified chunk IDs from both PostgreSQL pgvector and local embedded store.
+    """
+    if not chunk_ids:
+        return
+
+    # 1. Local store
+    local_entries = get_local_vector_store()
+    ids_set = {str(c) for c in chunk_ids}
+    remaining = [e for e in local_entries if str(e.get("id")) not in ids_set]
+    save_local_vector_store(remaining)
+
+    # 2. PostgreSQL
+    try:
+        async with engine.begin() as conn:
+            for cid in chunk_ids:
+                await conn.execute(
+                    text("DELETE FROM langchain_pg_embedding WHERE id = :id"),
+                    {"id": str(cid)},
+                )
+        logger.info("Deleted %d vectors from PostgreSQL pgvector.", len(chunk_ids))
+    except Exception as e:
+        logger.debug("PostgreSQL vector delete skipped (%s).", e)
+
+
+async def store_documents(documents: Sequence[Document]) -> list[str]:
+    """Legacy helper: Stores chunks into local JSON store and syncs to PostgreSQL pgvector."""
+    if not documents:
+        return []
+
+    texts = [d.page_content for d in documents]
+    vectors = embed_texts(texts)
+
+    entries = []
+    doc_ids = []
+    for doc, vec in zip(documents, vectors):
+        chunk_id = doc.metadata.get("chunk_id") or str(uuid.uuid4())
+        doc_ids.append(chunk_id)
+        entries.append({
+            "id": chunk_id,
+            "document": doc.page_content,
+            "cmetadata": doc.metadata,
+            "embedding": vec,
+        })
+
+    await upsert_vector_store(entries)
     return doc_ids
 
 
@@ -282,48 +752,292 @@ def get_policy_file_path() -> Path:
     return candidate if candidate.exists() else raw
 
 
+# ============================================================
+# 4. INCREMENTAL DOCUMENT INDEXING WITH HYBRID CHUNKING
+# ============================================================
+
+async def process_document_upload(
+    file_bytes: bytes,
+    file_name: str,
+    db: AsyncSession,
+    forced_doc_id: uuid.UUID | None = None,
+) -> DocumentUploadResponse:
+    """
+    Incremental document indexing using hybrid chunking:
+    1. Extracts text with page-number and heading structure tracking.
+    2. Computes SHA-256 document content hash.
+    3. Maintains Document registry.
+    4. Applies hybrid chunking (heading detection, topic grouping, semantic sub-chunking, small overlap).
+    5. Generates stable chunk IDs (doc_{id}_{sec}_{top}_{idx:03d}) and SHA-256 content hashes.
+    6. Incremental comparison:
+       - Same chunk ID + same hash -> SKIP embedding
+       - Same chunk ID + different hash -> RE-EMBED & UPSERT
+       - New chunk ID -> EMBED & INSERT
+       - Old chunk ID missing in new document -> DELETE vector & chunk metadata
+    7. Updates document status (UPLOADED -> PROCESSING -> INDEXED / UPDATED).
+    """
+    if not file_bytes:
+        raise ExtractionError(f"Uploaded file '{file_name}' is empty (0 bytes).")
+
+    # 1. Text & metadata extraction
+    pages, doc_meta, doc_hash, file_type = extract_document_text(file_bytes, file_name)
+    if not pages or not any(p.get("text", "").strip() for p in pages):
+        raise ExtractionError(f"No readable text could be extracted from '{file_name}'.")
+
+    # 2. Document Registry Lookup
+    is_existing = False
+    doc_id: uuid.UUID
+
+    if forced_doc_id:
+        stmt = select(DocumentModel).where(DocumentModel.document_id == forced_doc_id)
+    else:
+        stmt = select(DocumentModel).where(DocumentModel.file_name == file_name)
+
+    res = await db.execute(stmt)
+    existing_doc = res.scalar_one_or_none()
+
+    if existing_doc:
+        doc_id = existing_doc.document_id
+        doc_record = existing_doc
+        is_existing = True
+    else:
+        doc_id = forced_doc_id or uuid.uuid4()
+        doc_record = DocumentModel(
+            document_id=doc_id,
+            file_name=file_name,
+            file_hash=doc_hash,
+            file_type=file_type,
+            status="PROCESSING",
+            chunk_count=0,
+        )
+        db.add(doc_record)
+        await db.flush()
+
+    # 3. Retrieve existing chunks for this document
+    stmt_chunks = select(DocumentChunk).where(DocumentChunk.document_id == doc_id)
+    res_chunks = await db.execute(stmt_chunks)
+    old_chunks = {c.chunk_id: c for c in res_chunks.scalars().all()}
+
+    # Scenario 6: Exact same document hash and already indexed
+    if is_existing and existing_doc.file_hash == doc_hash and len(old_chunks) > 0:
+        logger.info("Document '%s' (id=%s) hash is unchanged; skipping all embeddings.", file_name, doc_id)
+        return DocumentUploadResponse(
+            document_id=doc_id,
+            file_name=file_name,
+            file_hash=doc_hash,
+            file_type=file_type,
+            status=existing_doc.status,
+            total_chunks=len(old_chunks),
+            chunks_added=0,
+            chunks_updated=0,
+            chunks_skipped=len(old_chunks),
+            chunks_deleted=0,
+            message=f"Document '{file_name}' is unchanged. 0 chunks re-embedded, {len(old_chunks)} skipped.",
+        )
+
+    doc_record.status = "PROCESSING"
+    await db.flush()
+
+    # 4. Hybrid chunking
+    hybrid_chunks = hybrid_chunk_pages(
+        pages_data=pages,
+        document_id=doc_id,
+        file_name=file_name,
+    )
+    new_chunks_map = {c.chunk_id: c for c in hybrid_chunks}
+
+    # 5. Incremental Diff Comparison
+    to_skip: list[HybridChunk] = []
+    to_update: list[HybridChunk] = []
+    to_insert: list[HybridChunk] = []
+    to_delete_ids: list[str] = []
+
+    for cid, c in new_chunks_map.items():
+        if cid in old_chunks:
+            if old_chunks[cid].content_hash == c.content_hash:
+                to_skip.append(c)
+            else:
+                to_update.append(c)
+        else:
+            to_insert.append(c)
+
+    for old_cid in old_chunks:
+        if old_cid not in new_chunks_map:
+            to_delete_ids.append(old_cid)
+
+    logger.info(
+        "Incremental diff for '%s': %d to insert, %d to update, %d to skip, %d to delete.",
+        file_name,
+        len(to_insert),
+        len(to_update),
+        len(to_skip),
+        len(to_delete_ids),
+    )
+
+    # 6. Execute Deletions
+    if to_delete_ids:
+        await delete_from_vector_store(to_delete_ids)
+        del_stmt = delete(DocumentChunk).where(DocumentChunk.chunk_id.in_(to_delete_ids))
+        await db.execute(del_stmt)
+
+    # 7. Embed & Upsert ONLY affected chunks (to_insert + to_update)
+    chunks_to_embed = to_insert + to_update
+    if chunks_to_embed:
+        texts_to_embed = [c.content for c in chunks_to_embed]
+        vectors = embed_texts(texts_to_embed)
+
+        vector_entries = []
+        for c, vec in zip(chunks_to_embed, vectors):
+            vector_entries.append({
+                "id": c.chunk_id,
+                "document": c.content,
+                "cmetadata": {
+                    "document_id": str(doc_id),
+                    "file_name": file_name,
+                    "filename": file_name,
+                    "chunk_id": c.chunk_id,
+                    "section": c.section,
+                    "topic": c.topic,
+                    "chunk_index": c.chunk_index,
+                    "page_number": c.page_number,
+                    "page": c.page_number,
+                    "content_hash": c.content_hash,
+                },
+                "embedding": vec,
+            })
+        await upsert_vector_store(vector_entries)
+
+        now = datetime.now(timezone.utc)
+        for c in to_update:
+            old_c = old_chunks[c.chunk_id]
+            old_c.content = c.content
+            old_c.content_hash = c.content_hash
+            old_c.section = c.section
+            old_c.topic = c.topic
+            old_c.page_number = c.page_number
+            old_c.chunk_index = c.chunk_index
+            old_c.updated_at = now
+
+        for c in to_insert:
+            new_chunk_row = DocumentChunk(
+                chunk_id=c.chunk_id,
+                document_id=doc_id,
+                section=c.section,
+                topic=c.topic,
+                chunk_index=c.chunk_index,
+                content=c.content,
+                content_hash=c.content_hash,
+                page_number=c.page_number,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(new_chunk_row)
+
+    # 8. Update Document record
+    doc_record.file_hash = doc_hash
+    doc_record.status = "UPDATED" if is_existing else "INDEXED"
+    doc_record.chunk_count = len(hybrid_chunks)
+    doc_record.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(doc_record)
+
+    return DocumentUploadResponse(
+        document_id=doc_record.document_id,
+        file_name=doc_record.file_name,
+        file_hash=doc_record.file_hash,
+        file_type=doc_record.file_type,
+        status=doc_record.status,
+        total_chunks=len(hybrid_chunks),
+        chunks_added=len(to_insert),
+        chunks_updated=len(to_update),
+        chunks_skipped=len(to_skip),
+        chunks_deleted=len(to_delete_ids),
+        message=f"Indexed '{file_name}': {len(to_insert)} added, {len(to_update)} updated, {len(to_skip)} skipped, {len(to_delete_ids)} deleted.",
+    )
+
+
+async def get_documents(db: AsyncSession) -> list[DocumentModel]:
+    """Returns all registered documents ordered by creation time."""
+    stmt = select(DocumentModel).order_by(DocumentModel.created_at.desc())
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
+
+
+async def get_document_detail(document_id: uuid.UUID, db: AsyncSession) -> tuple[DocumentModel | None, list[DocumentChunk]]:
+    """Returns document record and its indexed chunks."""
+    stmt = select(DocumentModel).where(DocumentModel.document_id == document_id)
+    res = await db.execute(stmt)
+    doc = res.scalar_one_or_none()
+    if not doc:
+        return None, []
+    stmt_chunks = select(DocumentChunk).where(DocumentChunk.document_id == document_id).order_by(DocumentChunk.chunk_index)
+    res_chunks = await db.execute(stmt_chunks)
+    return doc, list(res_chunks.scalars().all())
+
+
+async def delete_document(document_id: uuid.UUID, db: AsyncSession) -> bool:
+    """Deletes document, its chunks, and associated vector representations."""
+    stmt = select(DocumentModel).where(DocumentModel.document_id == document_id)
+    res = await db.execute(stmt)
+    doc = res.scalar_one_or_none()
+    if not doc:
+        return False
+
+    stmt_chunks = select(DocumentChunk.chunk_id).where(DocumentChunk.document_id == document_id)
+    res_chunks = await db.execute(stmt_chunks)
+    chunk_ids = list(res_chunks.scalars().all())
+
+    if chunk_ids:
+        await delete_from_vector_store(chunk_ids)
+
+    await db.delete(doc)
+    await db.commit()
+    return True
+
+
 async def index_company_policy(force_reindex: bool = False) -> int:
-    """Indexes company policy on application startup."""
+    """Indexes company policy on application startup into both vector store and document registry."""
     path = get_policy_file_path()
     if not path.exists():
         logger.error("Policy file not found at: %s", path)
         return 0
 
-    policy_text = path.read_text(encoding="utf-8")
+    policy_bytes = path.read_bytes()
 
-    # Check local store first
-    local_chunks = get_local_vector_store()
-    if not force_reindex and len(local_chunks) >= 30:
-        logger.info("Policy already indexed in local embedded store (%d chunks).", len(local_chunks))
-        return len(local_chunks)
-
-    # Check PostgreSQL
     try:
-        async with engine.connect() as conn:
-            res = await conn.execute(
-                text("SELECT count(*) FROM langchain_pg_embedding WHERE cmetadata->>'document_id' = :doc_id"),
-                {"doc_id": str(POLICY_DOC_ID)},
-            )
-            count = res.scalar() or 0
-            if not force_reindex and count >= 30:
-                logger.info("Policy already indexed in PostgreSQL (%d chunks).", count)
-                return count
-    except Exception:
-        pass
+        from src.database.connection import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            stmt = select(DocumentModel).where(DocumentModel.document_id == POLICY_DOC_ID)
+            res = await session.execute(stmt)
+            existing = res.scalar_one_or_none()
+            if not force_reindex and existing and existing.chunk_count > 0:
+                logger.info("Company policy already registered in DB (%d chunks).", existing.chunk_count)
+                return existing.chunk_count
 
-    raw_policy = Document(
-        page_content=policy_text,
-        metadata={"document_id": str(POLICY_DOC_ID), "filename": POLICY_FILENAME, "page": 1},
-    )
-    chunks = split_documents([raw_policy])
-    if chunks:
-        await store_documents(chunks)
-        return len(chunks)
-    return 0
+            upload_res = await process_document_upload(
+                file_bytes=policy_bytes,
+                file_name=path.name,
+                db=session,
+                forced_doc_id=POLICY_DOC_ID,
+            )
+            return upload_res.total_chunks
+    except Exception as e:
+        logger.warning("Database unavailable for policy registration (%s). Fallback indexing...", e)
+        # Fallback to local vector store
+        policy_text = path.read_text(encoding="utf-8")
+        raw_policy = Document(
+            page_content=policy_text,
+            metadata={"document_id": str(POLICY_DOC_ID), "filename": POLICY_FILENAME, "page": 1},
+        )
+        chunks = split_documents([raw_policy])
+        if chunks:
+            await store_documents(chunks)
+            return len(chunks)
+        return 0
 
 
 # ============================================================
-# 4. CONTEXTUAL RETRIEVAL & VECTOR SEARCH
+# 5. CONTEXTUAL RETRIEVAL & MULTI-DOCUMENT VECTOR SEARCH
 # ============================================================
 
 def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -> str:
@@ -357,9 +1071,11 @@ async def retrieve_relevant_chunks(
     query: str,
     top_k: int | None = None,
     chat_history: Sequence[Any] | None = None,
+    document_id: uuid.UUID | None = None,
 ) -> list[Document]:
     """
-    Retrieves semantically relevant policy chunks using dense vector embeddings + cosine similarity.
+    Retrieves semantically relevant document chunks using dense vector embeddings + cosine similarity.
+    Searches across ALL indexed documents by default, or filters by document_id when specified.
     Queries PostgreSQL pgvector when reachable; falls back to local embedded store seamlessly.
     """
     threshold = settings.min_similarity
@@ -379,10 +1095,15 @@ async def retrieve_relevant_chunks(
     # 1. Try PostgreSQL pgvector
     try:
         async with engine.connect() as conn:
-            res = await conn.execute(
-                text("SELECT id, cmetadata, document, embedding FROM langchain_pg_embedding WHERE cmetadata->>'document_id' = :doc_id"),
-                {"doc_id": str(POLICY_DOC_ID)},
-            )
+            if document_id:
+                res = await conn.execute(
+                    text("SELECT id, cmetadata, document, embedding FROM langchain_pg_embedding WHERE cmetadata->>'document_id' = :doc_id"),
+                    {"doc_id": str(document_id)},
+                )
+            else:
+                res = await conn.execute(
+                    text("SELECT id, cmetadata, document, embedding FROM langchain_pg_embedding")
+                )
             rows = res.fetchall()
             for row in rows:
                 cmetadata, content, emb = row[1] or {}, row[2] or "", row[3]
@@ -406,6 +1127,8 @@ async def retrieve_relevant_chunks(
         local_entries = get_local_vector_store()
         for item in local_entries:
             cmetadata, content, emb = item.get("cmetadata", {}), item.get("document", ""), item.get("embedding", [])
+            if document_id and cmetadata.get("document_id") != str(document_id):
+                continue
             if emb and len(emb) == len(q_arr):
                 c_arr = np.array(emb, dtype=np.float32)
                 c_norm = float(np.linalg.norm(c_arr)) or 1e-9
@@ -424,6 +1147,7 @@ async def retrieve_relevant_chunks(
     top_score = scored_chunks[0][0]
     effective_threshold = max(threshold, top_score - 0.12)
     return [doc for score, doc in scored_chunks[:k] if score >= effective_threshold]
+
 
 
 # ============================================================
@@ -459,10 +1183,24 @@ def format_context(documents: Sequence[Document]) -> str:
         return "No specific policy documents retrieved."
     blocks = []
     for doc in documents:
-        filename = doc.metadata.get("filename", POLICY_FILENAME)
-        page = doc.metadata.get("page", 1)
+        filename = doc.metadata.get("filename") or doc.metadata.get("file_name", POLICY_FILENAME)
+        page = doc.metadata.get("page") or doc.metadata.get("page_number", 1)
+        section = doc.metadata.get("section", "")
+        topic = doc.metadata.get("topic", "")
+        chunk_id = doc.metadata.get("chunk_id", "")
         score = doc.metadata.get("score", "N/A")
-        blocks.append(f"--- [Document: {filename} | Page: {page} | Similarity: {score}] ---\n{doc.page_content.strip()}")
+
+        header_parts = [f"Document: {filename}"]
+        if section and section != "Overview":
+            header_parts.append(f"Section: {section}")
+        if topic and topic not in ("General", "Details", "Introduction"):
+            header_parts.append(f"Topic: {topic}")
+        header_parts.append(f"Page: {page}")
+        if chunk_id:
+            header_parts.append(f"Chunk: {chunk_id}")
+        header_parts.append(f"Similarity: {score}")
+
+        blocks.append(f"--- [{' | '.join(header_parts)}] ---\n{doc.page_content.strip()}")
     return "\n\n".join(blocks)
 
 
@@ -481,9 +1219,14 @@ def format_chat_history(chat_history: Sequence[Any] | None) -> str:
 async def generate_rag_answer(
     question: str,
     chat_history: Sequence[Any] | None = None,
+    document_id: uuid.UUID | None = None,
 ) -> tuple[str, list[Document], bool]:
     """Executes pure LangChain LCEL RAG chain."""
-    chunks = await retrieve_relevant_chunks(query=question, chat_history=chat_history)
+    chunks = await retrieve_relevant_chunks(
+        query=question,
+        chat_history=chat_history,
+        document_id=document_id,
+    )
     llm = get_llm()
 
     if llm is None:
@@ -600,9 +1343,16 @@ class ChatService:
         raw_history = request.chat_history if request.chat_history is not None else request.history
         recent_history = raw_history[-6:] if raw_history else []
 
+        doc_filter = None
+        if request.document_id:
+            try:
+                doc_filter = uuid.UUID(request.document_id)
+            except Exception:
+                pass
+
         # 1. Record user message
         try:
-            await self.add_message(role="user", content=request.message)
+            await self.add_message(role="user", content=request.message, document_id=doc_filter)
         except Exception as e:
             logger.warning("Failed to save incoming user message: %s", e)
 
@@ -611,6 +1361,7 @@ class ChatService:
             answer, matching_docs, show_pdf = await generate_rag_answer(
                 question=request.message,
                 chat_history=recent_history,
+                document_id=doc_filter,
             )
         except Exception as e:
             logger.error("RAG pipeline failed: %s", e, exc_info=True)
@@ -618,17 +1369,27 @@ class ChatService:
             matching_docs = []
             show_pdf = True
 
-        seen_pages: set[int] = set()
+        seen_keys: set[str] = set()
         sources: list[SourceChunk] = []
         for d in matching_docs:
-            page = d.metadata.get("page", 1)
-            if page not in seen_pages:
-                seen_pages.add(page)
+            fname = d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME)
+            pg = int(d.metadata.get("page") or d.metadata.get("page_number", 1))
+            sec = d.metadata.get("section")
+            top = d.metadata.get("topic")
+            cid = d.metadata.get("chunk_id")
+            c_idx = int(d.metadata.get("chunk_index", 0))
+
+            dedup_key = cid or f"{fname}_{pg}_{sec}_{top}_{c_idx}"
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
                 sources.append(
                     SourceChunk(
-                        filename=d.metadata.get("filename", POLICY_FILENAME),
-                        page=page,
-                        chunk_index=d.metadata.get("chunk_index", 0),
+                        filename=fname,
+                        page=pg,
+                        chunk_index=c_idx,
+                        section=sec,
+                        topic=top,
+                        chunk_id=cid,
                     )
                 )
 
@@ -637,7 +1398,7 @@ class ChatService:
 
         # 3. Record assistant answer
         try:
-            await self.add_message(role="assistant", content=answer)
+            await self.add_message(role="assistant", content=answer, document_id=doc_filter)
         except Exception as e:
             logger.warning("Failed to save assistant message: %s", e)
 
