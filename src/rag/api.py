@@ -19,6 +19,7 @@ from src.rag.schema import (
 from src.rag.service import (
     ChatService,
     ExtractionError,
+    POLICY_DOC_ID,
     POLICY_PAGES,
     delete_document,
     generate_company_policy_pdf,
@@ -255,7 +256,20 @@ async def list_documents(
     """
     try:
         docs = await get_documents(db)
-        return docs
+        return [
+            DocumentInfoResponse(
+                document_id=d.document_id,
+                file_name=d.file_name,
+                file_hash=d.file_hash,
+                file_type=d.file_type,
+                status=d.status,
+                chunk_count=d.chunk_count,
+                is_default=(d.document_id == POLICY_DOC_ID),
+                created_at=d.created_at,
+                updated_at=d.updated_at,
+            )
+            for d in docs
+        ]
     except Exception as e:
         logger.error("Failed to list documents: %s", e, exc_info=True)
         raise HTTPException(
@@ -298,7 +312,18 @@ async def get_document(
             }
             for c in chunks
         ]
-        return DocumentDetailResponse(document=doc, chunks=chunk_data)
+        doc_info = DocumentInfoResponse(
+            document_id=doc.document_id,
+            file_name=doc.file_name,
+            file_hash=doc.file_hash,
+            file_type=doc.file_type,
+            status=doc.status,
+            chunk_count=doc.chunk_count,
+            is_default=(doc.document_id == POLICY_DOC_ID),
+            created_at=doc.created_at,
+            updated_at=doc.updated_at,
+        )
+        return DocumentDetailResponse(document=doc_info, chunks=chunk_data)
     except HTTPException:
         raise
     except Exception as e:
@@ -324,6 +349,12 @@ async def delete_doc(
         doc_uuid = uuid.UUID(document_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document UUID format.") from e
+
+    if doc_uuid == POLICY_DOC_ID:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The default company policy document is protected and cannot be deleted.",
+        )
 
     try:
         deleted = await delete_document(doc_uuid, db)

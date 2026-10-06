@@ -20,7 +20,17 @@ _PROJECT_LOOKUP_TERMS = (
 _PROJECT_ACTION_TERMS = ("status", "owner", "milestone", "milestones", "details", "progress")
 _POLICY_TERMS = (
     "policy",
+    "policies",
     "handbook",
+    "document",
+    "documents",
+    "uploaded",
+    "upload",
+    "pdf",
+    "file",
+    "files",
+    "knowledge base",
+    "kb",
     "pto",
     "leave",
     "sick",
@@ -50,6 +60,17 @@ _POLICY_TERMS = (
     "study leave",
     "laptop",
     "hardware",
+    "guideline",
+    "guidelines",
+    "rule",
+    "rules",
+    "procedure",
+    "procedures",
+    "contract",
+    "agreement",
+    "clause",
+    "summary",
+    "summarize",
 )
 
 

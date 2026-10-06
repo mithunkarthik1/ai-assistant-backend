@@ -61,6 +61,7 @@ class DocumentInfoResponse(BaseModel):
     file_type: str
     status: str
     chunk_count: int
+    is_default: bool = False
     created_at: Any = None
     updated_at: Any = None
 
