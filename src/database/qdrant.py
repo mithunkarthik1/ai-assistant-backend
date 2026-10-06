@@ -208,16 +208,29 @@ class QdrantService:
                 query_filter = Filter(must=conditions)
 
         try:
-            results = client.search(
-                collection_name=col_name,
-                query_vector=query_vector,
-                limit=limit,
-                query_filter=query_filter,
-                score_threshold=score_threshold,
-                with_payload=True,
-                with_vectors=False,
-            )
-            return results
+            if hasattr(client, "query_points"):
+                response = client.query_points(
+                    collection_name=col_name,
+                    query=query_vector,
+                    limit=limit,
+                    query_filter=query_filter,
+                    score_threshold=score_threshold,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                return response.points
+            elif hasattr(client, "search"):
+                results = client.search(
+                    collection_name=col_name,
+                    query_vector=query_vector,
+                    limit=limit,
+                    query_filter=query_filter,
+                    score_threshold=score_threshold,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                return results
+            return []
         except Exception as e:
             logger.error("Qdrant vector search failed in collection '%s': %s", col_name, e)
             return []

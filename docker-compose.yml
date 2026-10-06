@@ -34,6 +34,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./src:/app/src
+      - ./alembic:/app/alembic
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

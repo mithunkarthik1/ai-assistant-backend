@@ -628,6 +628,7 @@ async def upsert_vector_store(entries: list[dict[str, Any]]) -> None:
                 payload={
                     "document_id": str(meta.get("document_id", "")),
                     "chunk_id": cid,
+                    "content": entry.get("document") or entry.get("content", ""),
                     "section": meta.get("section"),
                     "topic": meta.get("topic"),
                     "page_number": int(meta.get("page_number") or meta.get("page") or 1),
@@ -1105,9 +1106,10 @@ async def retrieve_relevant_chunks(
                 db_chunks: dict[str, DocumentChunk] = {}
                 doc_names: dict[str, str] = {}
                 try:
-                    async with engine.connect() as conn:
+                    from src.database.connection import AsyncSessionLocal
+                    async with AsyncSessionLocal() as session:
                         if chunk_ids:
-                            res_c = await conn.execute(
+                            res_c = await session.execute(
                                 select(DocumentChunk).where(DocumentChunk.chunk_id.in_(chunk_ids))
                             )
                             for chk in res_c.scalars().all():
@@ -1115,7 +1117,7 @@ async def retrieve_relevant_chunks(
 
                             d_ids = {chk.document_id for chk in db_chunks.values()}
                             if d_ids:
-                                res_d = await conn.execute(
+                                res_d = await session.execute(
                                     select(DocumentModel.document_id, DocumentModel.file_name).where(
                                         DocumentModel.document_id.in_(list(d_ids))
                                     )
