@@ -8,9 +8,10 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from src.core.config import settings
 from src.database.connection import Base
 
-DEFAULT_DOC_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
+DEFAULT_DOC_ID = uuid.UUID(settings.policy_doc_id)
 
 
 class Document(Base):
@@ -91,6 +92,30 @@ class DocumentChunk(Base):
         return f"<DocumentChunk(id='{self.chunk_id}', doc_id={self.document_id}, section='{self.section}')>"
 
 
+class ChatSession(Base):
+    """
+    Chat sessions table tracking conversation sessions.
+    """
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String(255), primary_key=True, index=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ChatSession(id='{self.id}', title='{self.title}')>"
+
+
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
@@ -106,6 +131,7 @@ class ChatMessage(Base):
         default=DEFAULT_DOC_ID,
         index=True,
     )
+    session_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     role: Mapped[str] = mapped_column(String(20), nullable=False)  # "user" or "assistant"
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -115,4 +141,4 @@ class ChatMessage(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<ChatMessage(id={self.id}, role='{self.role}')>"
+        return f"<ChatMessage(id={self.id}, role='{self.role}', session_id='{self.session_id}')>"

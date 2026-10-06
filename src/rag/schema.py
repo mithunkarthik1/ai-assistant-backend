@@ -35,6 +35,7 @@ class ChatMessageResponse(BaseModel):
     role: str
     content: str
     created_at: Any = None
+    session_id: str | None = None
 
     model_config = {"from_attributes": True}
 

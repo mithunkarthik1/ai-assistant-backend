@@ -32,59 +32,49 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 async def init_db() -> None:
-    """Initialize application and pgvector-compatible tables."""
-    from src.rag.model import ChatMessage, Document, DocumentChunk  # noqa: F401
-
-    try:
-        async with engine.connect() as conn:
-            try:
-                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                await conn.commit()
-                logger.info("PostgreSQL pgvector extension verified/enabled.")
-            except Exception as exc:
-                await conn.rollback()
-                logger.debug("vector extension not enabled or not needed: %s", exc)
-    except Exception as exc:
-        logger.warning("Database connection unavailable during extension setup: %s", exc)
+    """Initialize relational application tables in the database."""
+    from src.rag.model import ChatMessage, ChatSession, Document, DocumentChunk  # noqa: F401
 
     try:
         async with engine.begin() as conn:
+            # Migrate legacy column names on documents table if present
+            await conn.execute(text("""
+            DO $migrate$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'documents' AND column_name = 'id'
+                ) THEN
+                    ALTER TABLE documents RENAME COLUMN id TO document_id;
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'documents' AND column_name = 'filename'
+                ) THEN
+                    ALTER TABLE documents RENAME COLUMN filename TO file_name;
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'documents' AND column_name = 'file_size'
+                ) THEN
+                    ALTER TABLE documents ALTER COLUMN file_size DROP NOT NULL;
+                END IF;
+            END $migrate$;
+            """))
+            # Ensure required columns exist on documents
+            await conn.execute(text("""
+            ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64) DEFAULT '';
+            ALTER TABLE documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER DEFAULT 0;
+            ALTER TABLE documents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+            """))
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS langchain_pg_collection (
-                uuid UUID PRIMARY KEY,
-                name VARCHAR,
-                cmetadata JSONB
-            )
+            ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id VARCHAR(255);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages (session_id);
             """))
-            try:
-                await conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
-                    id VARCHAR PRIMARY KEY,
-                    collection_id UUID REFERENCES langchain_pg_collection (uuid) ON DELETE CASCADE,
-                    embedding vector(384),
-                    document VARCHAR,
-                    cmetadata JSONB
-                )
-                """))
-                await conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_langchain_pg_embedding_hnsw
-                ON langchain_pg_embedding USING hnsw (embedding vector_cosine_ops)
-                """))
-            except Exception as exc:
-                logger.debug("pgvector native type fallback: %s", exc)
-                await conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS langchain_pg_embedding (
-                    id VARCHAR PRIMARY KEY,
-                    collection_id UUID REFERENCES langchain_pg_collection (uuid) ON DELETE CASCADE,
-                    embedding float8[],
-                    document VARCHAR,
-                    cmetadata JSONB
-                )
-                """))
-        logger.info("Application, pgvector tables, and HNSW indexes initialized successfully.")
+        logger.info("Application relational tables initialized successfully.")
     except Exception as exc:
-        logger.warning("Could not initialize PostgreSQL tables: %s (Running in local mode)", exc)
+        logger.warning("Database initialization notice: %s", exc)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

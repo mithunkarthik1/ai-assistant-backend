@@ -26,8 +26,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fastapi import HTTPException
 from src.core.config import settings
 from src.database.connection import engine
+from src.database.qdrant import chunk_id_to_qdrant_id, qdrant_service
+from qdrant_client.models import PointStruct
 from src.rag.model import ChatMessage, DEFAULT_DOC_ID, Document as DocumentModel, DocumentChunk
 from src.rag.schema import (
     ChatRequest,
@@ -40,10 +43,8 @@ from src.rag.schema import (
 
 logger = logging.getLogger("src.rag.service")
 
-POLICY_DOC_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
-POLICY_FILENAME = "WorkPilot_Company_Policy.pdf"
-LOCAL_VECTOR_STORE_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "local_vector_store.json"
-COLLECTION_ID = uuid.UUID("3a896d38-6cd0-4856-834b-12e07cff388e")
+POLICY_DOC_ID = uuid.UUID(settings.policy_doc_id)
+POLICY_FILENAME = Path(settings.policy_file_path).name
 
 # ============================================================
 # 1. DOCUMENT EXTRACTION UTILITIES (PDF, DOCX, TXT)
@@ -601,119 +602,64 @@ def split_documents(documents: Sequence[Document]) -> list[Document]:
 
 
 # ============================================================
-# 3. VECTOR STORAGE & INDEXING (DUAL-MODE / SERVICE-FREE)
+# 3. VECTOR STORAGE & INDEXING (QDRANT CLOUD)
 # ============================================================
-
-def get_local_vector_store() -> list[dict[str, Any]]:
-    """Reads local embedded vector store (zero DB service needed)."""
-    if not LOCAL_VECTOR_STORE_PATH.exists():
-        return []
-    try:
-        return json.loads(LOCAL_VECTOR_STORE_PATH.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.error("Failed to read local vector store: %s", e)
-        return []
-
-
-def save_local_vector_store(entries: list[dict[str, Any]]) -> None:
-    """Saves chunks and embeddings to local file."""
-    try:
-        LOCAL_VECTOR_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LOCAL_VECTOR_STORE_PATH.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("Saved %d vector records to local embedded store.", len(entries))
-    except Exception as e:
-        logger.error("Failed to save local vector store: %s", e)
-
 
 async def upsert_vector_store(entries: list[dict[str, Any]]) -> None:
     """
-    Upserts vector entries with stable chunk IDs into PostgreSQL pgvector
-    and local embedded store simultaneously.
+    Upserts vector entries with stable chunk IDs and metadata payloads into Qdrant Cloud.
     """
     if not entries:
         return
 
-    # 1. Update local store
-    local_entries = get_local_vector_store()
-    entry_map = {str(e["id"]): e for e in local_entries}
-    for e in entries:
-        entry_map[str(e["id"])] = e
-    save_local_vector_store(list(entry_map.values()))
+    if not qdrant_service.is_configured():
+        logger.warning("Qdrant Cloud is not configured; skipping vector upsert.")
+        return
 
-    # 2. Update PostgreSQL
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("INSERT INTO langchain_pg_collection (uuid, name) VALUES (:uuid, :name) ON CONFLICT (uuid) DO NOTHING"),
-                {"uuid": COLLECTION_ID, "name": "rag_documents"},
+    points = []
+    for entry in entries:
+        cid = str(entry["id"])
+        qid = chunk_id_to_qdrant_id(cid)
+        meta = entry.get("cmetadata") or {}
+        points.append(
+            PointStruct(
+                id=qid,
+                vector=entry["embedding"],
+                payload={
+                    "document_id": str(meta.get("document_id", "")),
+                    "chunk_id": cid,
+                    "section": meta.get("section"),
+                    "topic": meta.get("topic"),
+                    "page_number": int(meta.get("page_number") or meta.get("page") or 1),
+                    "content_hash": str(meta.get("content_hash", "")),
+                },
             )
-            for entry in entries:
-                vec_str = "[" + ",".join(str(f) for f in entry["embedding"]) + "]"
-                try:
-                    await conn.execute(
-                        text("""
-                        INSERT INTO langchain_pg_embedding (id, collection_id, embedding, document, cmetadata)
-                        VALUES (:id, :col_id, CAST(:vec AS vector), :doc, CAST(:meta AS jsonb))
-                        ON CONFLICT (id) DO UPDATE SET
-                            embedding = excluded.embedding,
-                            document = excluded.document,
-                            cmetadata = excluded.cmetadata
-                        """),
-                        {
-                            "id": str(entry["id"]),
-                            "col_id": COLLECTION_ID,
-                            "vec": vec_str,
-                            "doc": entry["document"],
-                            "meta": json.dumps(entry["cmetadata"]),
-                        },
-                    )
-                except Exception:
-                    await conn.execute(
-                        text("""
-                        INSERT INTO langchain_pg_embedding (id, collection_id, embedding, document, cmetadata)
-                        VALUES (:id, :col_id, CAST(:vec AS float8[]), :doc, CAST(:meta AS jsonb))
-                        ON CONFLICT (id) DO UPDATE SET
-                            embedding = excluded.embedding,
-                            document = excluded.document,
-                            cmetadata = excluded.cmetadata
-                        """),
-                        {
-                            "id": str(entry["id"]),
-                            "col_id": COLLECTION_ID,
-                            "vec": entry["embedding"],
-                            "doc": entry["document"],
-                            "meta": json.dumps(entry["cmetadata"]),
-                        },
-                    )
-        logger.info("Upserted %d vector records to PostgreSQL pgvector.", len(entries))
+        )
+    try:
+        qdrant_service.upsert_points(points)
+        logger.info(
+            "Upserted %d vector points to Qdrant Cloud collection '%s'.",
+            len(points),
+            qdrant_service.collection_name,
+        )
     except Exception as e:
-        logger.debug("PostgreSQL vector upsert skipped (%s). Using local embedded store.", e)
+        logger.error("Failed to upsert points into Qdrant Cloud: %s", e)
+        raise
 
 
 async def delete_from_vector_store(chunk_ids: Sequence[str]) -> None:
     """
-    Deletes specified chunk IDs from both PostgreSQL pgvector and local embedded store.
+    Deletes specified chunk IDs from Qdrant Cloud.
     """
     if not chunk_ids:
         return
 
-    # 1. Local store
-    local_entries = get_local_vector_store()
-    ids_set = {str(c) for c in chunk_ids}
-    remaining = [e for e in local_entries if str(e.get("id")) not in ids_set]
-    save_local_vector_store(remaining)
-
-    # 2. PostgreSQL
-    try:
-        async with engine.begin() as conn:
-            for cid in chunk_ids:
-                await conn.execute(
-                    text("DELETE FROM langchain_pg_embedding WHERE id = :id"),
-                    {"id": str(cid)},
-                )
-        logger.info("Deleted %d vectors from PostgreSQL pgvector.", len(chunk_ids))
-    except Exception as e:
-        logger.debug("PostgreSQL vector delete skipped (%s).", e)
+    if qdrant_service.is_configured():
+        try:
+            qdrant_service.delete_points(chunk_ids)
+            logger.info("Deleted %d points from Qdrant Cloud.", len(chunk_ids))
+        except Exception as e:
+            logger.error("Failed to delete points from Qdrant Cloud: %s", e)
 
 
 async def store_documents(documents: Sequence[Document]) -> list[str]:
@@ -905,7 +851,16 @@ async def process_document_upload(
                 },
                 "embedding": vec,
             })
-        await upsert_vector_store(vector_entries)
+        try:
+            await upsert_vector_store(vector_entries)
+        except Exception as e:
+            logger.error("Vector database upsert failed for '%s': %s", file_name, e)
+            doc_record.status = "FAILED"
+            await db.commit()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Vector indexing failed for '{file_name}'. Document marked as FAILED and can be retried.",
+            ) from e
 
         now = datetime.now(timezone.utc)
         for c in to_update:
@@ -990,6 +945,12 @@ async def delete_document(document_id: uuid.UUID, db: AsyncSession) -> bool:
     if chunk_ids:
         await delete_from_vector_store(chunk_ids)
 
+    if qdrant_service.is_configured():
+        try:
+            qdrant_service.delete_by_document(document_id)
+        except Exception as e:
+            logger.error("Failed to delete document from Qdrant: %s", e)
+
     await db.delete(doc)
     await db.commit()
     return True
@@ -1011,6 +972,33 @@ async def index_company_policy(force_reindex: bool = False) -> int:
             res = await session.execute(stmt)
             existing = res.scalar_one_or_none()
             if not force_reindex and existing and existing.chunk_count > 0:
+                if qdrant_service.is_configured():
+                    q_health = qdrant_service.health_check()
+                    if q_health.get("points_count", 0) == 0:
+                        logger.info("Synchronizing existing PostgreSQL chunks to Qdrant Cloud...")
+                        stmt_chunks = select(DocumentChunk).where(DocumentChunk.document_id == POLICY_DOC_ID)
+                        res_chunks = await session.execute(stmt_chunks)
+                        db_chunks = list(res_chunks.scalars().all())
+                        if db_chunks:
+                            texts = [c.content for c in db_chunks]
+                            vecs = embed_texts(texts)
+                            entries = []
+                            for c, v in zip(db_chunks, vecs):
+                                entries.append({
+                                    "id": c.chunk_id,
+                                    "embedding": v,
+                                    "document": c.content,
+                                    "cmetadata": {
+                                        "document_id": str(c.document_id),
+                                        "chunk_id": c.chunk_id,
+                                        "section": c.section,
+                                        "topic": c.topic,
+                                        "page_number": c.page_number,
+                                        "content_hash": c.content_hash,
+                                    },
+                                })
+                            await upsert_vector_store(entries)
+                            logger.info("Successfully synced %d chunks to Qdrant Cloud.", len(entries))
                 logger.info("Company policy already registered in DB (%d chunks).", existing.chunk_count)
                 return existing.chunk_count
 
@@ -1074,9 +1062,9 @@ async def retrieve_relevant_chunks(
     document_id: uuid.UUID | None = None,
 ) -> list[Document]:
     """
-    Retrieves semantically relevant document chunks using dense vector embeddings + cosine similarity.
-    Searches across ALL indexed documents by default, or filters by document_id when specified.
-    Queries PostgreSQL pgvector when reachable; falls back to local embedded store seamlessly.
+    Retrieves semantically relevant document chunks using Qdrant Cloud vector search as
+    the dedicated vector database, fetching authoritative chunk content from PostgreSQL
+    (the source-of-truth database), with seamless fallback to pgvector/local stores.
     """
     threshold = settings.min_similarity
     k = top_k or settings.top_k
@@ -1092,50 +1080,98 @@ async def retrieve_relevant_chunks(
 
     scored_chunks: list[tuple[float, Document]] = []
 
-    # 1. Try PostgreSQL pgvector
-    try:
-        async with engine.connect() as conn:
+    # 1. Primary Vector Search: Qdrant Cloud
+    if qdrant_service.is_configured():
+        try:
+            filters = {}
             if document_id:
-                res = await conn.execute(
-                    text("SELECT id, cmetadata, document, embedding FROM langchain_pg_embedding WHERE cmetadata->>'document_id' = :doc_id"),
-                    {"doc_id": str(document_id)},
-                )
-            else:
-                res = await conn.execute(
-                    text("SELECT id, cmetadata, document, embedding FROM langchain_pg_embedding")
-                )
-            rows = res.fetchall()
-            for row in rows:
-                cmetadata, content, emb = row[1] or {}, row[2] or "", row[3]
-                if isinstance(emb, str):
-                    try:
-                        emb = [float(x.strip()) for x in emb.strip("[]").split(",") if x.strip()]
-                    except Exception:
-                        emb = []
-                if emb and len(emb) == len(q_arr):
-                    c_arr = np.array(emb, dtype=np.float32)
-                    c_norm = float(np.linalg.norm(c_arr)) or 1e-9
-                    sim = float(np.dot(q_arr, c_arr) / (q_norm * c_norm))
-                else:
-                    sim = 0.0
-                scored_chunks.append((sim, Document(page_content=content, metadata={**cmetadata, "score": round(sim, 4)})))
-    except Exception as e:
-        logger.debug("PostgreSQL query skipped (offline or not ready): %s", e)
+                filters["document_id"] = str(document_id)
 
-    # 2. Fallback to local embedded store (no database service needed!)
-    if not scored_chunks:
-        local_entries = get_local_vector_store()
-        for item in local_entries:
-            cmetadata, content, emb = item.get("cmetadata", {}), item.get("document", ""), item.get("embedding", [])
-            if document_id and cmetadata.get("document_id") != str(document_id):
-                continue
-            if emb and len(emb) == len(q_arr):
-                c_arr = np.array(emb, dtype=np.float32)
-                c_norm = float(np.linalg.norm(c_arr)) or 1e-9
-                sim = float(np.dot(q_arr, c_arr) / (q_norm * c_norm))
-            else:
-                sim = 0.0
-            scored_chunks.append((sim, Document(page_content=content, metadata={**cmetadata, "score": round(sim, 4)})))
+            qdrant_results = qdrant_service.search(
+                query_vector=q_vec,
+                limit=k * 3,
+                filters=filters if filters else None,
+                score_threshold=threshold,
+            )
+
+            if qdrant_results:
+                chunk_ids = [
+                    pt.payload.get("chunk_id")
+                    for pt in qdrant_results
+                    if pt.payload and pt.payload.get("chunk_id")
+                ]
+
+                # Fetch authoritative content and metadata from PostgreSQL (source of truth)
+                db_chunks: dict[str, DocumentChunk] = {}
+                doc_names: dict[str, str] = {}
+                try:
+                    async with engine.connect() as conn:
+                        if chunk_ids:
+                            res_c = await conn.execute(
+                                select(DocumentChunk).where(DocumentChunk.chunk_id.in_(chunk_ids))
+                            )
+                            for chk in res_c.scalars().all():
+                                db_chunks[chk.chunk_id] = chk
+
+                            d_ids = {chk.document_id for chk in db_chunks.values()}
+                            if d_ids:
+                                res_d = await conn.execute(
+                                    select(DocumentModel.document_id, DocumentModel.file_name).where(
+                                        DocumentModel.document_id.in_(list(d_ids))
+                                    )
+                                )
+                                for d_row in res_d.all():
+                                    doc_names[str(d_row[0])] = d_row[1]
+                except Exception as db_err:
+                    logger.warning("PostgreSQL fetch for chunk content skipped (%s). Using payload fallback.", db_err)
+
+                for pt in qdrant_results:
+                    payload = pt.payload or {}
+                    cid = payload.get("chunk_id")
+                    if not cid:
+                        continue
+                    score = float(pt.score)
+
+                    # Authoritative PostgreSQL content
+                    if cid in db_chunks:
+                        c_rec = db_chunks[cid]
+                        content = c_rec.content
+                        doc_id_str = str(c_rec.document_id)
+                        fname = doc_names.get(doc_id_str, payload.get("file_name", POLICY_FILENAME))
+                        sec = c_rec.section or payload.get("section")
+                        top = c_rec.topic or payload.get("topic")
+                        pg = c_rec.page_number or payload.get("page_number", 1)
+                        c_idx = c_rec.chunk_index
+                        c_hash = c_rec.content_hash or payload.get("content_hash", "")
+                    else:
+                        content = payload.get("content") or payload.get("document", "")
+                        fname = payload.get("file_name", POLICY_FILENAME)
+                        sec = payload.get("section")
+                        top = payload.get("topic")
+                        pg = int(payload.get("page_number", 1))
+                        c_idx = int(payload.get("chunk_index", 0))
+                        c_hash = payload.get("content_hash", "")
+
+                    if content:
+                        doc = Document(
+                            page_content=content,
+                            metadata={
+                                "document_id": payload.get("document_id"),
+                                "filename": fname,
+                                "file_name": fname,
+                                "chunk_id": cid,
+                                "section": sec,
+                                "topic": top,
+                                "page": pg,
+                                "page_number": pg,
+                                "chunk_index": c_idx,
+                                "content_hash": c_hash,
+                                "score": round(score, 4),
+                            },
+                        )
+                        scored_chunks.append((score, doc))
+        except Exception as e:
+            logger.error("Qdrant similarity search encountered an error: %s. Falling back to secondary stores.", e)
 
     if not scored_chunks:
         return []
@@ -1293,11 +1329,13 @@ class ChatService:
         role: str,
         content: str,
         document_id: uuid.UUID | None = None,
+        session_id: str | None = None,
     ) -> ChatMessage:
         """Inserts and commits a new chat message into the database."""
         try:
             msg = ChatMessage(
                 document_id=document_id or DEFAULT_DOC_ID,
+                session_id=session_id,
                 role=role,
                 content=content,
             )
@@ -1313,17 +1351,20 @@ class ChatService:
     async def get_history(
         self,
         document_id: uuid.UUID | None = None,
+        session_id: str | None = None,
         limit: int = 50,
     ) -> Sequence[ChatMessage]:
-        """Fetches recent message history for a given document in chronological order."""
+        """Fetches recent message history for a given session or document in chronological order."""
         try:
-            doc_id = document_id or DEFAULT_DOC_ID
-            stmt = (
-                select(ChatMessage)
-                .where(ChatMessage.document_id == doc_id)
-                .order_by(ChatMessage.created_at.desc())
-                .limit(limit)
-            )
+            stmt = select(ChatMessage)
+            if session_id:
+                stmt = stmt.where(ChatMessage.session_id == session_id)
+            elif document_id:
+                stmt = stmt.where(ChatMessage.document_id == document_id)
+            else:
+                stmt = stmt.where(ChatMessage.document_id == DEFAULT_DOC_ID)
+
+            stmt = stmt.order_by(ChatMessage.created_at.desc()).limit(limit)
             result = await self.session.execute(stmt)
             messages = list(result.scalars().all())
             messages.reverse()
@@ -1352,7 +1393,12 @@ class ChatService:
 
         # 1. Record user message
         try:
-            await self.add_message(role="user", content=request.message, document_id=doc_filter)
+            await self.add_message(
+                role="user",
+                content=request.message,
+                document_id=doc_filter,
+                session_id=request.session_id,
+            )
         except Exception as e:
             logger.warning("Failed to save incoming user message: %s", e)
 
@@ -1398,7 +1444,12 @@ class ChatService:
 
         # 3. Record assistant answer
         try:
-            await self.add_message(role="assistant", content=answer, document_id=doc_filter)
+            await self.add_message(
+                role="assistant",
+                content=answer,
+                document_id=doc_filter,
+                session_id=request.session_id,
+            )
         except Exception as e:
             logger.warning("Failed to save assistant message: %s", e)
 
@@ -1557,7 +1608,7 @@ def generate_company_policy_pdf(target_path: Path | str | None = None) -> Path:
     Generates an official enterprise-grade WorkPilot Company Policy Handbook PDF.
     """
     if target_path is None:
-        target_path = Path(__file__).resolve().parent.parent.parent / "data" / "WorkPilot_Company_Policy.pdf"
+        target_path = get_policy_file_path()
     else:
         target_path = Path(target_path)
 

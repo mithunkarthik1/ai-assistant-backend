@@ -24,13 +24,14 @@ from src.rag.service import (
     generate_company_policy_pdf,
     get_document_detail,
     get_documents,
+    get_policy_file_path,
     process_document_upload,
 )
 
 logger = logging.getLogger("src.rag.api")
 router = APIRouter(prefix="/chat", tags=["chat"])
 documents_router = APIRouter(prefix="/documents", tags=["documents"])
-
+rag_router = APIRouter(prefix="/rag", tags=["rag"])
 
 
 @router.post(
@@ -70,6 +71,22 @@ async def chat_with_policy(
         ) from e
 
 
+@rag_router.post(
+    "/query",
+    response_model=ChatResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Execute RAG query with Qdrant vector retrieval and LLM generation",
+)
+async def query_rag_endpoint(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ChatResponse:
+    """
+    Submits user question to RAG pipeline via Qdrant similarity search and LLM synthesis.
+    """
+    return await chat_with_policy(request, db)
+
+
 @router.get(
     "/history",
     response_model=list[ChatMessageResponse],
@@ -83,6 +100,7 @@ async def chat_with_policy(
 )
 async def get_chat_history(
     document_id: str | None = None,
+    session_id: str | None = None,
     db: AsyncSession = Depends(get_db),
 ) -> list[ChatMessageResponse]:
     """
@@ -90,7 +108,13 @@ async def get_chat_history(
     """
     try:
         service = ChatService(db)
-        history = await service.get_history()
+        doc_uuid = None
+        if document_id:
+            try:
+                doc_uuid = uuid.UUID(document_id)
+            except Exception:
+                pass
+        history = await service.get_history(document_id=doc_uuid, session_id=session_id)
         logger.debug("Retrieved %d history items", len(history))
         return history
     except Exception as e:
@@ -110,7 +134,7 @@ async def get_policy_pdf() -> FileResponse:
     Serves the official company policy PDF document for inline browser viewing.
     """
     try:
-        pdf_path = Path(__file__).resolve().parent.parent.parent / "data" / "WorkPilot_Company_Policy.pdf"
+        pdf_path = get_policy_file_path()
         if not pdf_path.exists():
             logger.info("PDF handbook not found on disk; generating fresh copy...")
             generate_company_policy_pdf(pdf_path)
@@ -122,13 +146,14 @@ async def get_policy_pdf() -> FileResponse:
                 detail="Policy PDF document not found.",
             )
 
+        fname = pdf_path.name
         return FileResponse(
             path=str(pdf_path),
             media_type="application/pdf",
-            filename="WorkPilot_Company_Policy.pdf",
+            filename=fname,
             content_disposition_type="inline",
             headers={
-                "Content-Disposition": 'inline; filename="WorkPilot_Company_Policy.pdf"',
+                "Content-Disposition": f'inline; filename="{fname}"',
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Expose-Headers": "Content-Disposition",
             },
