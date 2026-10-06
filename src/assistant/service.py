@@ -91,6 +91,37 @@ class UnifiedAssistantService:
                 show_pdf=response.show_pdf,
             )
 
+        if decision.route == "direct":
+            if self.rag_service_factory is None:
+                from src.rag.service import ChatService
+
+                self.rag_service_factory = ChatService
+            try:
+                from src.rag.service import retrieve_relevant_chunks
+
+                matching_chunks = await retrieve_relevant_chunks(
+                    query=request.message,
+                    chat_history=session.messages,
+                )
+                if matching_chunks:
+                    response = await self.rag_service_factory(db).chat(
+                        ChatRequest(
+                            message=request.message,
+                            session_id=session_id,
+                            history=session.messages,
+                        )
+                    )
+                    self.store.append(session_id, request.message, response.answer, session.current_project_id)
+                    return AssistantResponse(
+                        answer=response.answer,
+                        route="policy",
+                        session_id=session_id,
+                        sources=response.sources,
+                        show_pdf=response.show_pdf,
+                    )
+            except Exception as e:
+                logger.warning("Knowledge base retrieval check for direct route skipped: %s", e)
+
         agent_response = await self._get_agent_service().chat(
             AgentRequest(
                 message=request.message,

@@ -629,6 +629,7 @@ async def upsert_vector_store(entries: list[dict[str, Any]]) -> None:
                     "document_id": str(meta.get("document_id", "")),
                     "chunk_id": cid,
                     "content": entry.get("document") or entry.get("content", ""),
+                    "file_name": meta.get("file_name") or meta.get("filename", ""),
                     "section": meta.get("section"),
                     "topic": meta.get("topic"),
                     "page_number": int(meta.get("page_number") or meta.get("page") or 1),
@@ -933,6 +934,12 @@ async def get_document_detail(document_id: uuid.UUID, db: AsyncSession) -> tuple
 
 async def delete_document(document_id: uuid.UUID, db: AsyncSession) -> bool:
     """Deletes document, its chunks, and associated vector representations."""
+    if document_id == POLICY_DOC_ID:
+        raise HTTPException(
+            status_code=400,
+            detail="The default system policy document is protected and cannot be deleted.",
+        )
+
     stmt = select(DocumentModel).where(DocumentModel.document_id == document_id)
     res = await db.execute(stmt)
     doc = res.scalar_one_or_none()
@@ -1193,13 +1200,15 @@ async def retrieve_relevant_chunks(
 # ============================================================
 
 RAG_SYSTEM_PROMPT = """
-You are the intelligent reasoning layer of WorkPilot's HR Policy Assistant.
-Your job is to understand the employee's intent, map terminology to HR concepts, and provide an accurate, grounded, and concise answer based strictly on the retrieved knowledge base.
+You are WorkPilot's intelligent AI Assistant with access to the company's knowledge base and uploaded documents.
+Your job is to understand the user's inquiry and provide an accurate, grounded, helpful, and concise answer based strictly on the retrieved knowledge base.
 
 Guidelines:
-- The retrieved HR documents determine what is actually true.
-- Never invent HR policies, figures, limits, or deadlines. Bold key numbers and limits.
-- If information is not mentioned, state that it is not specified in available documents and refer to People Operations.
+- The retrieved knowledge base documents determine what is actually true.
+- Answer the user's question directly using the facts, data, procedures, limits, and guidelines contained in the retrieved context.
+- Bold key numbers, limits, deadlines, codes, and critical terms.
+- When referencing information from specific documents, cite the document name or section naturally if helpful.
+- If the requested information is not mentioned in the retrieved context, state that it is not specified in the available documents.
 
 ============================================================
 RETRIEVED KNOWLEDGE BASE
@@ -1210,8 +1219,8 @@ Answer the user's question directly adhering to all guidelines.
 """
 
 GENERAL_SYSTEM_PROMPT = """
-You are WorkPilot's intelligent HR Policy Assistant. The requested information is not documented in the available WorkPilot policies.
-Keep your response concise (1-2 sentences). State that the information is not specified in the WorkPilot policies and direct the employee to People Operations for confirmation.
+You are WorkPilot's intelligent AI Assistant. The requested information was not found in the available knowledge base documents.
+Provide a concise, helpful response. If the inquiry relates to company policies or internal operations, state that the information is not documented in the current knowledge base and suggest checking with the relevant team or People Operations.
 """
 
 
@@ -1289,11 +1298,18 @@ async def generate_rag_answer(
                 "question": question,
             })
             clean_answer = str(answer).strip()
-            show_pdf = any(p in clean_answer.lower() for p in ["not specified", "not documented", "people operations", "policy handbook"])
+            is_policy_doc = any(
+                (d.metadata.get("filename") == POLICY_FILENAME or str(d.metadata.get("document_id", "")) == str(POLICY_DOC_ID))
+                for d in chunks
+            )
+            show_pdf = is_policy_doc and any(
+                p in clean_answer.lower()
+                for p in ["not specified", "not documented", "people operations", "policy handbook"]
+            )
             return clean_answer, chunks, show_pdf
         except Exception as e:
             logger.error("LLM RAG invocation error: %s", e)
-            return f"⚠️ Error generating answer from LLM: {str(e)}", chunks, True
+            return f"⚠️ Error generating answer from LLM: {str(e)}", chunks, False
 
     # Fallback when out of scope
     fallback_prompt = ChatPromptTemplate.from_messages([
@@ -1303,13 +1319,13 @@ async def generate_rag_answer(
     fallback_chain = fallback_prompt | llm | output_parser
     try:
         answer = await fallback_chain.ainvoke({"question": question})
-        return str(answer).strip(), [], True
+        return str(answer).strip(), [], False
     except Exception as e:
         logger.error("Fallback LLM error: %s", e)
         return (
-            "I couldn't find information regarding that in the official company policy documents. Please consult People Operations.",
+            "I couldn't find information regarding that in the available knowledge base documents. Please consult People Operations or upload the relevant document.",
             [],
-            True,
+            False,
         )
 
 
