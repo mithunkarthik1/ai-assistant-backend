@@ -317,6 +317,38 @@ class QdrantService:
             logger.error("Failed to delete document '%s' points from Qdrant: %s", doc_str, e)
             return False
 
+    def delete_by_filename(
+        self,
+        file_name: str,
+        collection_name: str | None = None,
+    ) -> bool:
+        """
+        Deletes all vector points associated with a specific file_name from Qdrant.
+        """
+        client = self.connect()
+        if client is None:
+            return False
+
+        col_name = collection_name or self._collection_name
+        try:
+            client.delete(
+                collection_name=col_name,
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="file_name",
+                            match=MatchValue(value=file_name),
+                        )
+                    ]
+                ),
+                wait=True,
+            )
+            logger.info("Deleted all points for file '%s' from Qdrant collection '%s'.", file_name, col_name)
+            return True
+        except Exception as e:
+            logger.error("Failed to delete file '%s' points from Qdrant: %s", file_name, e)
+            return False
+
     def health_check(self) -> dict[str, Any]:
         """
         Performs a ping and collection verification to verify Qdrant cluster connectivity.

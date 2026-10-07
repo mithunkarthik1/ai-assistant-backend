@@ -37,7 +37,10 @@ async def init_db() -> None:
 
     try:
         async with engine.begin() as conn:
-            # Migrate legacy column names on documents table if present
+            # 1. Ensure all base application tables exist first
+            await conn.run_sync(Base.metadata.create_all)
+
+            # 2. Migrate legacy column names on documents table if present
             await conn.execute(text("""
             DO $migrate$
             BEGIN
@@ -67,7 +70,6 @@ async def init_db() -> None:
             ALTER TABLE documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER DEFAULT 0;
             ALTER TABLE documents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
             """))
-            await conn.run_sync(Base.metadata.create_all)
             await conn.execute(text("""
             ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id VARCHAR(255);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages (session_id);

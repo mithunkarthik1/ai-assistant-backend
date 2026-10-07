@@ -92,7 +92,12 @@ def normalize_extracted_pdf_text(text: str) -> str:
             continue
 
         is_bullet = line.startswith(("●", "○", "•", "■", "◆", "►")) or bool(re.match(r"^\d+[\.\)]\s", line))
-        is_heading = (line.endswith(":") and len(line.split()) <= 8) or bool(re.match(r"^(?:Section|Article|Chapter)\s+\d+", line, re.I))
+        is_heading = (
+            line.startswith("#")
+            or line.startswith("§")
+            or (line.endswith(":") and len(line.split()) <= 8)
+            or bool(re.match(r"^(?:§\s*|Section\s+|Article\s+|Chapter\s+)?\d+[:.\-\s]+[A-Za-z]", line, re.I))
+        )
 
         if pending_bullet:
             pending_bullet = False
@@ -380,9 +385,9 @@ def is_heading(line: str) -> tuple[bool, int, str]:
         if is_valid_topic_name(title):
             return True, level, title
 
-    # 2. Numbered headings (e.g. '1. Working Hours', 'Section 2: Remote Work', 'Article 3 - Leave')
+    # 2. Numbered headings (e.g. '1. Working Hours', '§ 5. Health Insurance', 'Section 2: Remote Work', 'Article 3 - Leave')
     numbered_match = re.match(
-        r"^(?:Section\s+|Article\s+)?(\d+(?:\.\d+)*)[:.\-\s]+\s*([A-Za-z].+)$",
+        r"^(?:§\s*|Section\s+|Article\s+)?(\d+(?:\.\d+)*)[:.\-\s]+\s*([A-Za-z].+)$",
         stripped,
         re.IGNORECASE,
     )
@@ -390,7 +395,7 @@ def is_heading(line: str) -> tuple[bool, int, str]:
         title = numbered_match.group(2).strip().rstrip(":")
         if is_valid_topic_name(title):
             num_parts = numbered_match.group(1).split(".")
-            level = min(len(num_parts) + 1, 4)
+            level = min(len(num_parts), 4)
             return True, level, f"{numbered_match.group(1)}. {title}"
 
     # 3. Standalone UPPERCASE heading (at least 8 chars, not ending in period)
@@ -405,6 +410,16 @@ def is_heading(line: str) -> tuple[bool, int, str]:
         if is_valid_topic_name(raw_title) and (raw_title[0].isupper() or raw_title[0].isdigit()):
             # Substantial headings (<= 5 words) get level 1, longer get level 2
             return True, 1 if len(raw_title.split()) <= 5 else 2, raw_title
+
+    # 5. Standalone Title Case line without terminal punctuation (e.g. 'Flight Booking Policy', 'Hotel Reimbursement Limits')
+    words = stripped.split()
+    if (
+        2 <= len(words) <= 6
+        and not stripped.endswith((".", ";", ",", "?", "!"))
+        and all(w[0].isupper() or w.lower() in ("and", "or", "of", "in", "to", "for", "the", "a", "an", "&") for w in words if w)
+        and is_valid_topic_name(stripped)
+    ):
+        return True, 1, stripped
 
     return False, 0, ""
 
@@ -425,6 +440,14 @@ def extract_topic_from_content(
     lines = [ln.strip() for ln in content.split("\n") if ln.strip()]
     if not lines:
         return section_name if is_valid_topic_name(section_name) else "General"
+
+    # 1. Check for section symbol § in lines
+    for line in lines[:8]:
+        sec_sym_search = re.search(r"§\s*(\d+)[:.\-\s]+\s*([A-Za-z][A-Za-z0-9\s/&()\-]+?)(?:\s*\||\s*--|\.\s|$)", line)
+        if sec_sym_search:
+            candidate = sec_sym_search.group(2).strip().rstrip(":")
+            if is_valid_topic_name(candidate) and len(candidate.split()) <= 6:
+                return candidate
 
     # 1. Check for bullet headers: e.g. "• Casual Leave (CL)" or "• Sick Leave (SL)"
     for line in lines[:8]:
@@ -904,6 +927,23 @@ async def process_document_upload(
 
     # 1. Text & metadata extraction
     pages, doc_meta, doc_hash, file_type = extract_document_text(file_bytes, file_name)
+    if forced_doc_id == POLICY_DOC_ID or file_name == POLICY_FILENAME:
+        # Use pristine structured POLICY_PAGES directly to ensure exact section and topic metadata
+        pages = []
+        for p in POLICY_PAGES:
+            pg_text_lines = []
+            for s in p.get("sections", []):
+                pg_text_lines.append(f"§ {s['num']}. {s['title']}")
+                if s.get("intro"):
+                    pg_text_lines.append(s["intro"])
+                for b in s.get("bullets", []):
+                    pg_text_lines.append(f"• {b}")
+                pg_text_lines.append("")
+            pages.append({
+                "page_number": p["page"],
+                "text": "\n".join(pg_text_lines),
+            })
+
     if not pages or not any(p.get("text", "").strip() for p in pages):
         raise ExtractionError(f"No readable text could be extracted from '{file_name}'.")
 
@@ -1131,6 +1171,8 @@ async def delete_document(document_id: uuid.UUID, db: AsyncSession) -> bool:
     if qdrant_service.is_configured():
         try:
             qdrant_service.delete_by_document(document_id)
+            if doc.file_name:
+                qdrant_service.delete_by_filename(doc.file_name)
         except Exception as e:
             logger.error("Failed to delete document from Qdrant: %s", e)
 
@@ -1211,18 +1253,54 @@ async def index_company_policy(force_reindex: bool = False) -> int:
 # 5. CONTEXTUAL RETRIEVAL & MULTI-DOCUMENT VECTOR SEARCH
 # ============================================================
 
+GREETING_WORDS = {
+    "hi", "hello", "hey", "hola", "namaste", "greetings", "good morning", "good evening",
+    "good afternoon", "howdy", "sup", "what's up", "whats up", "how are you", "who are you",
+    "thanks", "thank you", "thx", "bye", "goodbye", "ok", "okay", "cool", "nice", "great",
+}
+
+
+def is_greeting(query: str) -> bool:
+    """Checks if the query is a simple greeting, pleasantry, or conversational acknowledgment."""
+    if not query:
+        return False
+    cleaned = re.sub(r"[^\w\s]", "", query).strip().lower()
+    if cleaned in GREETING_WORDS:
+        return True
+    return any(
+        cleaned.startswith(g + " ")
+        for g in ("hi", "hello", "hey", "good morning", "good evening", "good afternoon")
+    )
+
+
+def is_dependent_followup(query: str) -> bool:
+    """Checks if a query is an anaphoric follow-up dependent on prior conversation context."""
+    cleaned = query.strip().lower()
+    if not cleaned:
+        return False
+    # Connectors indicating continuation of prior topic
+    connectors = (
+        "and ", "also ", "what about", "how about", "what if", "can i also",
+        "does it", "is it", "who is", "why is", "why does", "how long", "how much",
+        "tell me more", "explain more", "give more", "which one",
+    )
+    if any(cleaned.startswith(c) for c in connectors):
+        return True
+    # Pronouns that reference earlier entities
+    tokens = set(re.findall(r"\b\w+\b", cleaned))
+    pronouns = {"it", "its", "this", "that", "these", "those", "them", "they", "same"}
+    if tokens.intersection(pronouns) and len(tokens) <= 7:
+        return True
+    return False
+
+
 def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -> str:
     """Contextualizes brief follow-up queries with recent conversation context."""
-    if not chat_history:
+    if not chat_history or is_greeting(query):
         return query
 
     cleaned = query.strip()
-    words = cleaned.split()
-    is_short = len(words) <= 5
-    starts_with_connector = cleaned.lower().startswith(
-        ("and ", "also ", "what about", "how about", "what if", "can i also", "does it", "is it")
-    )
-    if not (is_short or starts_with_connector):
+    if not is_dependent_followup(cleaned):
         return query
 
     last_user_query = None
@@ -1230,8 +1308,10 @@ def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -
         role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else "") or "user"
         content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
         if role in ("user", "human") and content.strip():
-            last_user_query = content.strip()
-            break
+            # Never contextualize using previous greetings
+            if not is_greeting(content.strip()):
+                last_user_query = content.strip()
+                break
 
     if last_user_query and last_user_query.lower() != cleaned.lower():
         return f"{last_user_query} - {cleaned}"
@@ -1249,6 +1329,9 @@ async def retrieve_relevant_chunks(
     the dedicated vector database, fetching authoritative chunk content from PostgreSQL
     (the source-of-truth database), with seamless fallback to pgvector/local stores.
     """
+    if is_greeting(query):
+        return []
+
     threshold = settings.min_similarity
     k = top_k or settings.top_k
     search_query = contextualize_query(query, chat_history)
@@ -1288,8 +1371,10 @@ async def retrieve_relevant_chunks(
                 ]
 
                 # Fetch authoritative content and metadata from PostgreSQL (source of truth)
+                db_fetch_attempted = False
                 db_chunks: dict[str, DocumentChunk] = {}
                 doc_names: dict[str, str] = {}
+                orphan_chunk_ids: list[str] = []
                 try:
                     from src.database.connection import AsyncSessionLocal
                     async with AsyncSessionLocal() as session:
@@ -1309,6 +1394,7 @@ async def retrieve_relevant_chunks(
                                 )
                                 for d_row in res_d.all():
                                     doc_names[str(d_row[0])] = d_row[1]
+                        db_fetch_attempted = True
                 except Exception as db_err:
                     logger.warning("PostgreSQL fetch for chunk content skipped (%s). Using payload fallback.", db_err)
 
@@ -1320,9 +1406,10 @@ async def retrieve_relevant_chunks(
                     score = float(pt.score)
 
                     # Authoritative PostgreSQL content
-                    if db_chunks:
+                    if db_fetch_attempted:
                         if cid not in db_chunks:
-                            # Not in primary database (deleted or orphan) -> ignore
+                            # Not in primary database (deleted or orphan) -> ignore & queue for Qdrant prune
+                            orphan_chunk_ids.append(cid)
                             continue
                         c_rec = db_chunks[cid]
                         content = c_rec.content
@@ -1361,6 +1448,13 @@ async def retrieve_relevant_chunks(
                             },
                         )
                         scored_chunks.append((score, doc))
+
+                if orphan_chunk_ids and qdrant_service.is_configured():
+                    try:
+                        qdrant_service.delete_points(orphan_chunk_ids)
+                        logger.info("Auto-pruned %d orphan points from Qdrant Cloud.", len(orphan_chunk_ids))
+                    except Exception as prune_err:
+                        logger.warning("Failed to auto-prune orphan points from Qdrant: %s", prune_err)
         except Exception as e:
             logger.error("Qdrant similarity search encountered an error: %s. Falling back to secondary stores.", e)
 
@@ -1468,8 +1562,9 @@ Answer the user's question directly adhering to all guidelines.
 """
 
 GENERAL_SYSTEM_PROMPT = """
-You are WorkPilot's intelligent AI Assistant. The requested information was not found in the available knowledge base documents.
-Provide a concise, helpful response. If the inquiry relates to company policies or internal operations, state that the information is not documented in the current knowledge base and suggest checking with the relevant team or People Operations.
+You are WorkPilot's intelligent AI Assistant.
+For greetings or conversational pleasantries (such as "hi", "hello", "hey", "good morning"), respond warmly, politely, and naturally as an AI assistant ready to help with projects, tasks, and documents, without mentioning missing files.
+For specific inquiries whose answers are not found in the available knowledge base or uploaded documents, provide a helpful general response or state that the specific detail is not documented in the current knowledge base and suggest checking with the relevant team or People Operations.
 """
 
 
@@ -1793,6 +1888,33 @@ class ChatService:
         except Exception as e:
             logger.warning("Failed to save incoming user message: %s", e)
 
+        # Conversational greeting check: Dynamically generate greeting with zero document citations
+        if is_greeting(request.message):
+            try:
+                answer, _, _ = await generate_rag_answer(
+                    question=request.message,
+                    chat_history=recent_history,
+                    document_id=None,
+                )
+            except Exception as e:
+                logger.error("Dynamic greeting generation failed: %s", e)
+                answer = "Hello! How can I assist you today?"
+            try:
+                await self.add_message(
+                    role="assistant",
+                    content=answer,
+                    document_id=None,
+                    session_id=request.session_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to save greeting message: %s", e)
+            return ChatResponse(
+                answer=answer,
+                sources=[],
+                show_pdf=False,
+                session_id=request.session_id,
+            )
+
         # 2. Generate answer via LangChain RAG
         try:
             answer, matching_docs, show_pdf = await generate_rag_answer(
@@ -1831,8 +1953,29 @@ class ChatService:
         # If it's a negative answer and no specific document was targeted,
         # do not attach spurious sources from unrelated knowledge base documents
         if not (is_negative_answer and not doc_filter):
+            # Check which documents are explicitly referenced in the LLM answer
+            referenced_filenames = set()
+            answer_lower = answer.lower()
+            unique_doc_names = {d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME) for d in matching_docs}
+            if len(unique_doc_names) > 1:
+                for fn in unique_doc_names:
+                    base_fn = re.sub(r"\.[^.]+$", "", fn).lower()
+                    clean_fn = re.sub(r"^[\d.\-_ ]+", "", base_fn).strip()
+                    if (
+                        fn.lower() in answer_lower
+                        or base_fn in answer_lower
+                        or (len(clean_fn) >= 4 and clean_fn in answer_lower)
+                        or ("company policy" in answer_lower and ("workpilot" in fn.lower() or fn == POLICY_FILENAME))
+                        or ("handbook" in answer_lower and ("workpilot" in fn.lower() or fn == POLICY_FILENAME))
+                    ):
+                        referenced_filenames.add(fn)
+
             for d in matching_docs:
                 fname = d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME)
+                # If the answer specifically cited certain document(s) by name, discard unrelated documents
+                if referenced_filenames and fname not in referenced_filenames:
+                    continue
+
                 pg = int(d.metadata.get("page") or d.metadata.get("page_number", 1))
                 sec = d.metadata.get("section")
                 top = d.metadata.get("topic")
