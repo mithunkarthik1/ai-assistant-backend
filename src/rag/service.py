@@ -1,5 +1,5 @@
 """
-Comprehensive RAG Service module for WorkPilot AI Assistant.
+Comprehensive RAG Service module for AI Assistant.
 Contains the entire LangChain pipeline, FastEmbed embedding generation,
 dual-mode vector search (PostgreSQL pgvector + local embedded fallback),
 LLM answer synthesis, and chat persistence.
@@ -952,7 +952,9 @@ async def process_document_upload(
     doc_id: uuid.UUID
 
     if forced_doc_id:
-        stmt = select(DocumentModel).where(DocumentModel.document_id == forced_doc_id)
+        stmt = select(DocumentModel).where(
+            (DocumentModel.document_id == forced_doc_id) | (DocumentModel.file_name == file_name)
+        )
     else:
         stmt = select(DocumentModel).where(DocumentModel.file_name == file_name)
 
@@ -960,7 +962,9 @@ async def process_document_upload(
     existing_doc = res.scalar_one_or_none()
 
     if existing_doc:
-        doc_id = existing_doc.document_id
+        doc_id = forced_doc_id if forced_doc_id else existing_doc.document_id
+        if forced_doc_id and existing_doc.document_id != forced_doc_id:
+            existing_doc.document_id = forced_doc_id
         doc_record = existing_doc
         is_existing = True
     else:
@@ -1129,10 +1133,18 @@ async def process_document_upload(
 
 
 async def get_documents(db: AsyncSession) -> list[DocumentModel]:
-    """Returns all registered documents ordered by creation time."""
+    """Returns all registered documents ordered by creation time, deduplicated by file_name."""
     stmt = select(DocumentModel).order_by(DocumentModel.created_at.desc())
     res = await db.execute(stmt)
-    return list(res.scalars().all())
+    all_docs = list(res.scalars().all())
+    seen_names: set[str] = set()
+    unique_docs: list[DocumentModel] = []
+    for d in all_docs:
+        fn_key = d.file_name.lower().strip()
+        if fn_key not in seen_names:
+            seen_names.add(fn_key)
+            unique_docs.append(d)
+    return unique_docs
 
 
 async def get_document_detail(document_id: uuid.UUID, db: AsyncSession) -> tuple[DocumentModel | None, list[DocumentChunk]]:
@@ -1193,9 +1205,30 @@ async def index_company_policy(force_reindex: bool = False) -> int:
     try:
         from src.database.connection import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
-            stmt = select(DocumentModel).where(DocumentModel.document_id == POLICY_DOC_ID)
+            stmt = select(DocumentModel).where(
+                (DocumentModel.document_id == POLICY_DOC_ID) | (DocumentModel.file_name == POLICY_FILENAME)
+            )
             res = await session.execute(stmt)
-            existing = res.scalar_one_or_none()
+            existing_docs = list(res.scalars().all())
+
+            # Automatically purge duplicate records if more than one exists for company policy
+            if len(existing_docs) > 1:
+                logger.info("Found %d duplicate records for %s. Cleaning up duplicates...", len(existing_docs), POLICY_FILENAME)
+                primary = next((d for d in existing_docs if d.document_id == POLICY_DOC_ID), existing_docs[0])
+                for extra in existing_docs:
+                    if extra.document_id != primary.document_id:
+                        from sqlalchemy import delete as sql_delete
+                        await session.execute(sql_delete(DocumentChunk).where(DocumentChunk.document_id == extra.document_id))
+                        await session.delete(extra)
+                        if qdrant_service.is_configured():
+                            try:
+                                qdrant_service.delete_by_document(extra.document_id)
+                            except Exception:
+                                pass
+                await session.commit()
+                existing = primary
+            else:
+                existing = existing_docs[0] if existing_docs else None
             if not force_reindex and existing and existing.chunk_count > 0:
                 if qdrant_service.is_configured():
                     q_health = qdrant_service.health_check()
@@ -1282,7 +1315,7 @@ def is_dependent_followup(query: str) -> bool:
     connectors = (
         "and ", "also ", "what about", "how about", "what if", "can i also",
         "does it", "is it", "who is", "why is", "why does", "how long", "how much",
-        "tell me more", "explain more", "give more", "which one",
+        "tell me more", "explain more", "give more", "which one", "what is",
     )
     if any(cleaned.startswith(c) for c in connectors):
         return True
@@ -1290,6 +1323,10 @@ def is_dependent_followup(query: str) -> bool:
     tokens = set(re.findall(r"\b\w+\b", cleaned))
     pronouns = {"it", "its", "this", "that", "these", "those", "them", "they", "same"}
     if tokens.intersection(pronouns) and len(tokens) <= 7:
+        return True
+    # Short refinements or query fragments in ongoing conversation (e.g., "per day?", "what about stay?", "limit?")
+    words = cleaned.split()
+    if len(words) <= 5 and not is_greeting(cleaned):
         return True
     return False
 
@@ -1303,19 +1340,165 @@ def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -
     if not is_dependent_followup(cleaned):
         return query
 
-    last_user_query = None
+    recent_user_queries = []
     for msg in reversed(chat_history):
         role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else "") or "user"
         content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
         if role in ("user", "human") and content.strip():
             # Never contextualize using previous greetings
             if not is_greeting(content.strip()):
-                last_user_query = content.strip()
-                break
+                recent_user_queries.append(content.strip())
+                if len(recent_user_queries) >= 2:
+                    break
 
-    if last_user_query and last_user_query.lower() != cleaned.lower():
-        return f"{last_user_query} - {cleaned}"
+    if recent_user_queries:
+        if len(recent_user_queries) > 1 and len(recent_user_queries[0].split()) <= 5:
+            context_prefix = f"{recent_user_queries[1]} - {recent_user_queries[0]}"
+        else:
+            context_prefix = recent_user_queries[0]
+        if context_prefix.lower() != cleaned.lower():
+            return f"{context_prefix} - {cleaned}"
     return query
+
+
+COMPARISON_QUERY_PATTERNS = [
+    r"\bcompare\b",
+    r"\bcomparison\b",
+    r"\bdifference(?:s)?\s+(?:between|in)\b",
+    r"\bversus\b",
+    r"\bvs\.?\b",
+    r"\bboth\s+(?:documents|policies|handbooks|files)\b",
+    r"\bcompare\s+both\b",
+    r"\bin\s+both\b",
+]
+
+BROAD_QUERY_PATTERNS = [
+    r"\ball\s+policies\b",
+    r"\ball\s+(?:the\s+)?policies\b",
+    r"\blist\s+all\b",
+    r"\bsummarize\b",
+    r"\bsummary\s+of\b",
+    r"\boverview\s+of\b",
+    r"\bgeneral\s+overview\b",
+    r"\btable\s+of\s+contents\b",
+    r"\bwhat\s+topics\b",
+    r"\bwhat\s+is\s+covered\b",
+    r"\bwhat\s+does\s+the\s+handbook\s+cover\b",
+    r"\bwhat\s+policies\s+exist\b",
+    r"\ball\s+leave\s+types\b",
+    r"\ball\s+types\s+of\s+leave\b",
+    r"\blist\s+(?:all\s+)?guidelines\b",
+    r"\bwhat\s+are\s+the\s+company\s+policies\b",
+    r"\boutline\b",
+    r"\bwalk\s+through\s+(?:all|the)\b",
+]
+
+
+def is_comparison_query(query: str) -> bool:
+    """Detects if query asks to compare, contrast, or review across multiple documents."""
+    if not query:
+        return False
+    q_lower = query.lower()
+    return any(re.search(pat, q_lower) for pat in COMPARISON_QUERY_PATTERNS)
+
+
+def is_broad_query(query: str) -> bool:
+    """Detects broad, multi-section overview queries."""
+    if not query:
+        return False
+    q_lower = query.lower()
+    return any(re.search(pat, q_lower) for pat in BROAD_QUERY_PATTERNS)
+
+
+def get_competing_documents(
+    chunks: Sequence[Document],
+    query: str,
+    threshold: float = 0.70,
+    margin: float = 0.08,
+) -> list[dict[str, Any]]:
+    """
+    Identifies truly competing documents when a query matches multiple documents.
+    Only triggers when:
+    1. Query is NOT already a comparison query ('compare both', 'difference between', etc.).
+    2. At least two distinct documents have strong relevance (best_score >= threshold).
+    3. The score gap between the top document and runner-up is <= margin (e.g. 0.08).
+       If one document is clearly superior (gap > margin or runner-up < threshold),
+       do NOT trigger disambiguation.
+    """
+    if not chunks or is_comparison_query(query):
+        return []
+
+    docs_info: dict[str, dict[str, Any]] = {}
+    for chk in chunks:
+        doc_id = str(chk.metadata.get("document_id") or "")
+        fname = chk.metadata.get("filename") or chk.metadata.get("file_name") or ""
+        score = float(chk.metadata.get("score") or 0.0)
+        section = chk.metadata.get("section") or ""
+        topic = chk.metadata.get("topic") or ""
+        page = int(chk.metadata.get("page") or chk.metadata.get("page_number", 1))
+
+        if not doc_id or not fname:
+            continue
+
+        if doc_id not in docs_info:
+            docs_info[doc_id] = {
+                "document_id": doc_id,
+                "filename": fname,
+                "best_score": score,
+                "page": page,
+                "topics": [],
+                "sections": [],
+            }
+        else:
+            if score > docs_info[doc_id]["best_score"]:
+                docs_info[doc_id]["best_score"] = score
+                docs_info[doc_id]["page"] = page
+
+        generic_terms = {
+            "general", "details", "overview", "introduction", "section",
+            "handbook", "objective", "document", "notes", "part",
+        }
+        for item, key in [(topic, "topics"), (section, "sections")]:
+            val = item.strip()
+            if val and val.lower() not in generic_terms and not val.isdigit() and len(val) >= 3:
+                if val not in docs_info[doc_id][key]:
+                    docs_info[doc_id][key].append(val)
+
+    sorted_docs = sorted(docs_info.values(), key=lambda d: d["best_score"], reverse=True)
+    if len(sorted_docs) < 2:
+        return []
+
+    top_doc = sorted_docs[0]
+    runner_up = sorted_docs[1]
+
+    # Both documents must be strong matches
+    if top_doc["best_score"] < threshold or runner_up["best_score"] < threshold:
+        return []
+
+    # Score margin check: Only ask if documents genuinely compete within margin
+    if (top_doc["best_score"] - runner_up["best_score"]) > margin:
+        return []
+
+    competing = [
+        d for d in sorted_docs
+        if d["best_score"] >= threshold and (top_doc["best_score"] - d["best_score"]) <= margin
+    ]
+    return competing if len(competing) >= 2 else []
+
+
+def format_clarification_message(competing_docs: list[dict[str, Any]]) -> str:
+    """Formats a user-friendly disambiguation prompt highlighting document topics."""
+    bullets = []
+    for cd in competing_docs:
+        topics_list = cd.get("topics") or cd.get("sections") or []
+        summary = ", ".join(topics_list[:3]) if topics_list else "General Policies"
+        bullets.append(f"• **{cd['filename']}** — *covers {summary}*")
+    bullets_text = "\n\n".join(bullets)
+    return (
+        "Your question matches information found in multiple documents in the knowledge base:\n\n"
+        f"{bullets_text}\n\n"
+        "Please specify which document you would like to consult."
+    )
 
 
 async def retrieve_relevant_chunks(
@@ -1334,6 +1517,7 @@ async def retrieve_relevant_chunks(
 
     threshold = settings.min_similarity
     k = top_k or settings.top_k
+    broad = is_broad_query(query)
     search_query = contextualize_query(query, chat_history)
 
     try:
@@ -1354,11 +1538,12 @@ async def retrieve_relevant_chunks(
                 filters["document_id"] = str(document_id)
 
             # When querying a specific targeted document, relax threshold so we retrieve its content
-            search_threshold = 0.05 if document_id else threshold
+            search_threshold = 0.05 if document_id else (min(threshold, 0.40) if broad else threshold)
+            search_limit = max(k * 5, 25) if broad else (k * 3)
 
             qdrant_results = qdrant_service.search(
                 query_vector=q_vec,
-                limit=k * 3,
+                limit=search_limit,
                 filters=filters if filters else None,
                 score_threshold=search_threshold,
             )
@@ -1496,6 +1681,24 @@ async def retrieve_relevant_chunks(
 
     scored_chunks.sort(key=lambda x: x[0], reverse=True)
 
+    if broad and scored_chunks:
+        # Multi-section retrieval for broad queries: collect top chunks across distinct sections
+        sections_seen: dict[tuple[str, str], int] = {}
+        diverse_candidates: list[Document] = []
+        for score, doc in scored_chunks:
+            if score < (threshold - 0.15):
+                continue
+            did = str(doc.metadata.get("document_id") or "")
+            sec = str(doc.metadata.get("section") or doc.metadata.get("topic") or f"page_{doc.metadata.get('page')}").strip().lower()
+            key = (did, sec)
+            if sections_seen.get(key, 0) < 2:
+                diverse_candidates.append(doc)
+                sections_seen[key] = sections_seen.get(key, 0) + 1
+                if len(diverse_candidates) >= max(k, 8):
+                    break
+        if diverse_candidates:
+            return diverse_candidates
+
     if document_id:
         # When specifically querying a targeted document, return its top chunks
         return [doc for score, doc in scored_chunks[:k]]
@@ -1562,26 +1765,56 @@ async def retrieve_relevant_chunks(
 # ============================================================
 
 RAG_SYSTEM_PROMPT = """
-You are WorkPilot's intelligent AI Assistant with access to the company's knowledge base and uploaded documents.
-Your job is to understand the user's inquiry and provide an accurate, grounded, helpful, and concise answer based strictly on the retrieved knowledge base.
+You are intelligent AI Assistant with access to the company's knowledge base and uploaded policy documents.
+Your job is to provide accurate, strictly grounded, and professional answers based exclusively on the retrieved knowledge base.
 
-Guidelines:
-- The retrieved knowledge base documents determine what is actually true.
-- Answer the user's question directly using the facts, data, procedures, limits, and guidelines contained in the retrieved context.
-- Bold key numbers, limits, deadlines, codes, and critical terms.
-- When referencing information from specific documents, cite the document name or section naturally if helpful.
-- If the requested information is not mentioned in the retrieved context, state that it is not specified in the available documents.
+CRITICAL DIRECTIVES:
+
+1. SOURCE GROUNDING & ANTI-HALLUCINATION:
+- The retrieved knowledge base determines what is factually true. Do not invent, speculate, or introduce external rules.
+- If the requested information is NOT in the retrieved context, explicitly state: "This is not specified in the available documents."
+
+2. SCENARIO REASONING (NO UNSUPPORTED ASSUMPTIONS):
+- For employee hypothetical scenarios or case questions, base every step of your reasoning STRICTLY on the explicit rules in the retrieved text.
+- Do NOT assume standard industry practices, probation defaults, or unwritten corporate exceptions.
+- If a scenario hinges on a rule not explicitly detailed (e.g., prorated accrual calculation, manager discretion guidelines), clearly point out what the document specifies and state what remains unstated or subject to People Operations review.
+
+3. DATE & TEMPORAL HANDLING (RESPECT DOCUMENT YEAR):
+- Respect the exact document year, calendar year, validity period, or effective dates stated in the retrieved documents.
+- Do NOT arbitrarily assume documents or policies are expired, invalid, or obsolete unless an expiration date is explicitly stated in the text.
+- When stating annual limits, carryovers, or dates, always cite the timeframe as documented (e.g., "Under the 2024 policy...").
+
+4. CITATIONS (ALWAYS SHOW SOURCE & PAGE):
+- Attribute key statements, limits, and rules using inline citations in the format `(Document Name, Section, Page X)` or `(Document Name, Page X)`.
+- Never cite a page or document that is not present in the retrieved context headers.
+
+5. CALCULATIONS (SHOW FORMULA & BREAKDOWN):
+- Whenever answering questions involving numbers, totals, leave accruals, carry-overs, encashments, working days, or prorated amounts:
+- ALWAYS show the step-by-step mathematical breakdown under a clearly formatted block:
+  **Calculation:**
+  • Step 1: [formula / rate from document]
+  • Step 2: [arithmetic breakdown]
+  • **Total:** [final computed value]
+
+6. BROAD & MULTI-SECTION QUERIES:
+- For broad overviews, summaries, or requests for all policies/guidelines, synthesize across all retrieved sections. Organize the response with clear headings or bullet points covering each distinct area found in the context.
+
+7. MULTI-DOCUMENT COMPARISON:
+- When comparing documents (or when retrieved context contains multiple distinct policies), clearly contrast them under labeled sections:
+  • **[Document 1]**: [provisions]
+  • **[Document 2]**: [provisions]
+  • **Key Differences**: [comparison table or bullet points]
 
 ============================================================
 RETRIEVED KNOWLEDGE BASE
 ============================================================
 {context}
 
-Answer the user's question directly adhering to all guidelines.
+Answer the user's question directly adhering to all guidelines above.
 """
 
 GENERAL_SYSTEM_PROMPT = """
-You are WorkPilot's intelligent AI Assistant.
+You are intelligent AI Assistant.
 For greetings or conversational pleasantries (such as "hi", "hello", "hey", "good morning"), respond warmly, politely, and naturally as an AI assistant ready to help with projects, tasks, and documents, without mentioning missing files.
 For specific inquiries whose answers are not found in the available knowledge base or uploaded documents, provide a helpful general response or state that the specific detail is not documented in the current knowledge base and suggest checking with the relevant team or People Operations.
 """
@@ -1630,13 +1863,17 @@ async def generate_rag_answer(
     question: str,
     chat_history: Sequence[Any] | None = None,
     document_id: uuid.UUID | None = None,
+    pre_retrieved_chunks: list[Document] | None = None,
 ) -> tuple[str, list[Document], bool]:
     """Executes pure LangChain LCEL RAG chain."""
-    chunks = await retrieve_relevant_chunks(
-        query=question,
-        chat_history=chat_history,
-        document_id=document_id,
-    )
+    if pre_retrieved_chunks is not None:
+        chunks = pre_retrieved_chunks
+    else:
+        chunks = await retrieve_relevant_chunks(
+            query=question,
+            chat_history=chat_history,
+            document_id=document_id,
+        )
     llm = get_llm()
 
     if llm is None:
@@ -1938,18 +2175,16 @@ class ChatService:
                 session_id=request.session_id,
             )
 
-        # 2. Generate answer via LangChain RAG
+        # 2. Retrieve candidate chunks
         try:
-            answer, matching_docs, show_pdf = await generate_rag_answer(
-                question=request.message,
+            matching_docs = await retrieve_relevant_chunks(
+                query=request.message,
                 chat_history=recent_history,
                 document_id=doc_filter,
             )
         except Exception as e:
-            logger.error("RAG pipeline failed: %s", e, exc_info=True)
-            answer = "⚠️ An error occurred while generating the answer. Please try again shortly."
+            logger.error("Chunk retrieval failed: %s", e, exc_info=True)
             matching_docs = []
-            show_pdf = True
 
         if doc_filter and matching_docs:
             matching_docs = [
@@ -1958,23 +2193,11 @@ class ChatService:
             ]
 
         # Multi-document disambiguation check:
-        # If the search matches two or more distinct documents and the user hasn't specified which one,
-        # ask the user to clarify and list the candidate documents below.
+        # Only ask when genuinely competing documents are found within margin and threshold
         if not doc_filter and matching_docs:
-            distinct_docs: dict[str, str] = {}
-            for d in matching_docs:
-                did = str(d.metadata.get("document_id") or "")
-                fname = d.metadata.get("filename") or d.metadata.get("file_name") or ""
-                if did and fname:
-                    distinct_docs[did] = fname
-            if len(distinct_docs) >= 2:
-                doc_bullets = "\n".join([f"• **{fname}**" for fname in distinct_docs.values()])
-                clarification_answer = (
-                    "Your question matches information found in multiple documents in the knowledge base.\n\n"
-                    "Please specify which document you would like to consult:\n"
-                    f"{doc_bullets}\n\n"
-                    "You can select or type the document name to see the exact answer."
-                )
+            competing = get_competing_documents(matching_docs, request.message)
+            if competing:
+                clarification_answer = format_clarification_message(competing)
                 try:
                     await self.add_message(
                         role="assistant",
@@ -1986,22 +2209,58 @@ class ChatService:
                     logger.warning("Failed to save clarification message: %s", e)
                 return ChatResponse(
                     answer=clarification_answer,
-                    sources=[
-                        SourceChunk(
-                            filename=fname,
-                            document_id=str(did) if did else None,
-                            page=1,
-                            chunk_index=0,
-                        )
-                        for did, fname in distinct_docs.items()
-                    ],
+                    sources=[],
                     show_pdf=False,
                     session_id=request.session_id,
                 )
 
+        # If not competing and not comparison query, and multiple documents exist:
+        # If top document is dominant (gap > margin), focus matching_docs on the dominant document
+        if not doc_filter and matching_docs and not is_comparison_query(request.message):
+            scores_by_doc: dict[str, float] = {}
+            for d in matching_docs:
+                did = str(d.metadata.get("document_id") or "")
+                sc = float(d.metadata.get("score") or 0.0)
+                scores_by_doc[did] = max(scores_by_doc.get(did, 0.0), sc)
+            sorted_by_score = sorted(scores_by_doc.items(), key=lambda x: x[1], reverse=True)
+            if len(sorted_by_score) >= 2 and sorted_by_score[0][1] >= 0.70:
+                top_did, top_sc = sorted_by_score[0]
+                runner_did, runner_sc = sorted_by_score[1]
+                if (top_sc - runner_sc) > 0.08:
+                    matching_docs = [d for d in matching_docs if str(d.metadata.get("document_id") or "") == top_did]
+
+        # 3. Generate answer via LangChain RAG
+        try:
+            answer, matching_docs, show_pdf = await generate_rag_answer(
+                question=request.message,
+                chat_history=recent_history,
+                document_id=doc_filter,
+                pre_retrieved_chunks=matching_docs,
+            )
+        except Exception as e:
+            logger.error("RAG pipeline failed: %s", e, exc_info=True)
+            answer = "⚠️ An error occurred while generating the answer. Please try again shortly."
+            matching_docs = []
+            show_pdf = True
+
         # Detect if LLM stated the requested topic is not found / not documented
+        answer_lower = answer.lower()
+        unique_doc_names = {d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME) for d in matching_docs}
+        referenced_filenames = set()
+        for fn in unique_doc_names:
+            base_fn = re.sub(r"\.[^.]+$", "", fn).lower()
+            clean_fn = re.sub(r"^[\d.\-_ ]+", "", base_fn).strip()
+            if (
+                fn.lower() in answer_lower
+                or base_fn in answer_lower
+                or (len(clean_fn) >= 4 and clean_fn in answer_lower)
+                or ("company policy" in answer_lower and ("workpilot" in fn.lower() or fn == POLICY_FILENAME))
+                or ("handbook" in answer_lower and ("workpilot" in fn.lower() or fn == POLICY_FILENAME))
+            ):
+                referenced_filenames.add(fn)
+
         is_negative_answer = any(
-            phrase in answer.lower()
+            phrase in answer_lower
             for phrase in [
                 "not specified in the retrieved knowledge base",
                 "not documented in the current knowledge base",
@@ -2015,25 +2274,8 @@ class ChatService:
         seen_keys: set[str] = set()
         sources: list[SourceChunk] = []
 
-        # If it's a negative answer and no specific document was targeted,
-        # do not attach spurious sources from unrelated knowledge base documents
-        if not (is_negative_answer and not doc_filter):
-            # Check which documents are explicitly referenced in the LLM answer
-            referenced_filenames = set()
-            answer_lower = answer.lower()
-            unique_doc_names = {d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME) for d in matching_docs}
-            if len(unique_doc_names) > 1:
-                for fn in unique_doc_names:
-                    base_fn = re.sub(r"\.[^.]+$", "", fn).lower()
-                    clean_fn = re.sub(r"^[\d.\-_ ]+", "", base_fn).strip()
-                    if (
-                        fn.lower() in answer_lower
-                        or base_fn in answer_lower
-                        or (len(clean_fn) >= 4 and clean_fn in answer_lower)
-                        or ("company policy" in answer_lower and ("workpilot" in fn.lower() or fn == POLICY_FILENAME))
-                        or ("handbook" in answer_lower and ("workpilot" in fn.lower() or fn == POLICY_FILENAME))
-                    ):
-                        referenced_filenames.add(fn)
+        # Only suppress sources when the answer is purely negative and cites zero documents
+        if not (is_negative_answer and not referenced_filenames and not doc_filter):
 
             for d in matching_docs:
                 fname = d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME)

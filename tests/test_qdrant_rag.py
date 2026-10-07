@@ -105,7 +105,14 @@ def test_qdrant_rag_pipeline():
     assert health["qdrant"]["status"] == "healthy", f"Qdrant unhealthy: {health}"
     assert health["qdrant"]["collection_exists"] is True, "Qdrant collection should exist"
     assert health["embedding"] == "available", "Embedding should be available"
-    print("✓ Test 1 passed: PostgreSQL, Qdrant Cloud, and embedding provider all healthy.")
+    # Clean up any leftover test docs from interrupted prior test runs
+    try:
+        existing_docs = http_get_json(f"{BASE_URL}/documents")
+        for d in existing_docs:
+            if "test_remote_" in d.get("file_name", ""):
+                http_delete_json(f"{BASE_URL}/documents/{d['document_id']}")
+    except Exception:
+        pass
 
     # ----------------------------------------------------
     # Test 2: Upload New Document A
