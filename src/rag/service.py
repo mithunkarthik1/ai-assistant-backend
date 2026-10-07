@@ -1504,10 +1504,29 @@ async def retrieve_relevant_chunks(
         return []
 
     top_score = scored_chunks[0][0]
-    effective_threshold = max(threshold, top_score - 0.12)
-    filtered = [doc for score, doc in scored_chunks[:k] if score >= effective_threshold]
+    effective_threshold = max(threshold, top_score - 0.14)
 
-    # Filter out spurious chunks that have zero lexical relevance when similarity is mediocre (< 0.72)
+    # Group candidate chunks by document to ensure multi-document diversity
+    docs_by_id: dict[str, list[tuple[float, Document]]] = {}
+    for score, doc in scored_chunks:
+        if score < effective_threshold:
+            continue
+        did = str(doc.metadata.get("document_id") or "")
+        if did not in docs_by_id:
+            docs_by_id[did] = []
+        docs_by_id[did].append((score, doc))
+
+    filtered_candidates: list[Document] = []
+    if len(docs_by_id) >= 2:
+        # Multiple documents match: ensure each matching document is represented in the candidates
+        per_doc_limit = max(2, k // len(docs_by_id))
+        for did, d_list in docs_by_id.items():
+            for score, doc in d_list[:per_doc_limit]:
+                filtered_candidates.append(doc)
+    else:
+        filtered_candidates = [doc for score, doc in scored_chunks[:k] if score >= effective_threshold]
+
+    # Filter out spurious chunks that have zero lexical relevance when similarity is mediocre (< 0.70)
     stop_words = {
         "what", "is", "are", "the", "a", "an", "in", "of", "to", "for", "on", "with",
         "about", "how", "why", "when", "where", "can", "could", "should", "would",
@@ -1516,9 +1535,9 @@ async def retrieve_relevant_chunks(
     q_words = {w for w in re.findall(r"\w+", query.lower()) if len(w) > 2 and w not in stop_words}
 
     meaningful: list[Document] = []
-    for doc in filtered:
+    for doc in filtered_candidates:
         d_score = float(doc.metadata.get("score") or 0.0)
-        if d_score >= 0.72:
+        if d_score >= 0.70:
             meaningful.append(doc)
             continue
         chunk_text = (
@@ -1707,10 +1726,6 @@ async def detect_target_document_from_query(
                 default_aliases = [
                     "workpilot",
                     "work pilot",
-                    "company policy",
-                    "company handbook",
-                    "default policy",
-                    "employee handbook",
                     "workpilot_company_policy",
                 ]
                 for alias in default_aliases:
@@ -1724,11 +1739,16 @@ async def detect_target_document_from_query(
                 normalized_stem = re.sub(r"[\(\)\[\]\{\}\-_,\.:;]+", " ", clean_stem).strip()
                 words = [w for w in normalized_stem.split() if len(w) > 1]
 
-                # Generate n-grams (bigrams and trigrams)
-                bigrams = [" ".join(words[i:i+2]) for i in range(len(words)-1)]
-                trigrams = [" ".join(words[i:i+3]) for i in range(len(words)-2)]
+                # Generic terms that describe document types or general policy topics, NOT specific document identity
+                GENERIC_DOCUMENT_TERMS = {
+                    "policy", "policies", "leave", "leaves", "handbook", "guide", "manual",
+                    "document", "documents", "doc", "docs", "file", "files", "pdf", "txt",
+                    "docx", "rules", "guidelines", "faq", "notes", "overview", "details",
+                    "information", "info", "process", "procedure", "procedures", "general",
+                }
+                identifying_words = [w for w in words if w not in GENERIC_DOCUMENT_TERMS]
 
-                # Check exact and clean file stems
+                # 1. Exact or clean file stems in query (e.g. "in ms-leave-policy.pdf", "ms-leave-policy")
                 if fname in q_lower or (len(stem) >= 3 and stem in q_lower):
                     doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 120)
                 elif len(clean_stem) >= 3 and clean_stem in q_lower:
@@ -1736,24 +1756,27 @@ async def detect_target_document_from_query(
                 elif len(normalized_stem) >= 3 and normalized_stem in q_lower:
                     doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 100)
 
-                # Check trigrams
-                for tri in trigrams:
-                    if tri in q_lower and len(tri) >= 4:
-                        doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 90 + len(tri))
-
-                # Check bigrams (e.g. "bubble sort", "ms leave")
-                for bi in bigrams:
-                    if bi in q_lower and len(bi) >= 4:
-                        doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 80 + len(bi))
-
-                # Check first unique keyword combined with doc/pdf/file/policy/handbook
-                if words and words[0] not in ("company", "policy", "the", "doc", "file"):
-                    first = words[0]
-                    if len(first) >= 3 and first in q_lower:
-                        if any(kw in q_lower for kw in ("policy", "leave", "doc", "pdf", "handbook", "file")):
-                            doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 75)
-                        elif len(words) == 1 or len(first) >= 6:
-                            doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 70)
+                # 2. Check identifying words: user query MUST contain at least one distinguishing keyword of this document
+                if identifying_words:
+                    matching_id_words = [
+                        w for w in identifying_words
+                        if re.search(r"\b" + re.escape(w) + r"\b", q_lower) or (len(w) >= 4 and w in q_lower)
+                    ]
+                    if len(identifying_words) == 1:
+                        # Single distinguishing keyword (e.g. "ms" for "ms-leave-policy.pdf")
+                        w = identifying_words[0]
+                        has_word = bool(re.search(r"\b" + re.escape(w) + r"\b", q_lower))
+                        if has_word:
+                            if any(kw in q_lower for kw in ("policy", "leave", "doc", "pdf", "handbook", "file", "guide", "manual", "document")) or len(q_lower.split()) <= 4:
+                                doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 90)
+                    else:
+                        # Multiple distinguishing keywords (e.g. "server", "infra" for "server_infra_guide.txt")
+                        if len(matching_id_words) >= 2:
+                            doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 95)
+                        elif len(matching_id_words) == 1:
+                            w = matching_id_words[0]
+                            if any(kw in q_lower for kw in ("policy", "leave", "doc", "pdf", "handbook", "file", "guide", "manual", "document", "what", "explain")) or len(q_lower.split()) <= 4:
+                                doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 85)
 
         if not doc_scores:
             return None
@@ -1933,6 +1956,48 @@ class ChatService:
                 d for d in matching_docs
                 if str(d.metadata.get("document_id", "")) == str(doc_filter)
             ]
+
+        # Multi-document disambiguation check:
+        # If the search matches two or more distinct documents and the user hasn't specified which one,
+        # ask the user to clarify and list the candidate documents below.
+        if not doc_filter and matching_docs:
+            distinct_docs: dict[str, str] = {}
+            for d in matching_docs:
+                did = str(d.metadata.get("document_id") or "")
+                fname = d.metadata.get("filename") or d.metadata.get("file_name") or ""
+                if did and fname:
+                    distinct_docs[did] = fname
+            if len(distinct_docs) >= 2:
+                doc_bullets = "\n".join([f"• **{fname}**" for fname in distinct_docs.values()])
+                clarification_answer = (
+                    "Your question matches information found in multiple documents in the knowledge base.\n\n"
+                    "Please specify which document you would like to consult:\n"
+                    f"{doc_bullets}\n\n"
+                    "You can select or type the document name to see the exact answer."
+                )
+                try:
+                    await self.add_message(
+                        role="assistant",
+                        content=clarification_answer,
+                        document_id=None,
+                        session_id=request.session_id,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to save clarification message: %s", e)
+                return ChatResponse(
+                    answer=clarification_answer,
+                    sources=[
+                        SourceChunk(
+                            filename=fname,
+                            document_id=str(did) if did else None,
+                            page=1,
+                            chunk_index=0,
+                        )
+                        for did, fname in distinct_docs.items()
+                    ],
+                    show_pdf=False,
+                    session_id=request.session_id,
+                )
 
         # Detect if LLM stated the requested topic is not found / not documented
         is_negative_answer = any(

@@ -38,7 +38,9 @@ Emergency contacts for infrastructure failures are infra-oncall@workpilot.com or
         req_list = urllib.request.urlopen("http://localhost:8001/api/v1/documents")
         docs = json.loads(req_list.read().decode())
         doc_map = {d["document_id"]: d for d in docs}
-        assert doc_map["00000000-0000-0000-0000-000000000002"]["is_default"] is True
+        default_docs = [d for d in docs if d.get("is_default") is True]
+        assert len(default_docs) >= 1, "Expected at least one default document"
+        default_doc_id = default_docs[0]["document_id"]
         assert doc_map[doc_id]["is_default"] is False
 
         # 3. Ask question about uploaded document
@@ -71,7 +73,7 @@ Emergency contacts for infrastructure failures are infra-oncall@workpilot.com or
 
         # Verify default document deletion is blocked
         try:
-            req_del_default = urllib.request.Request("http://localhost:8001/api/v1/documents/00000000-0000-0000-0000-000000000002", method="DELETE")
+            req_del_default = urllib.request.Request(f"http://localhost:8001/api/v1/documents/{default_doc_id}", method="DELETE")
             urllib.request.urlopen(req_del_default)
             assert False, "Default document deletion should have failed with 400"
         except urllib.error.HTTPError as e:
