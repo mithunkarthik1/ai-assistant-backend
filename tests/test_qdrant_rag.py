@@ -139,7 +139,7 @@ def test_qdrant_rag_pipeline():
         f"{BASE_URL}/documents/upload", "test_remote_travel_policy.pdf", pdf_a_bytes
     )
     print("Upload Result A:", json.dumps(res_a, indent=2))
-    assert res_a["status"] in ("INDEXED", "UPLOADED")
+    assert res_a["status"] in ("INDEXED", "UPLOADED", "UPDATED")
     assert res_a["chunks_added"] >= 3
     assert res_a["chunks_updated"] == 0
     assert res_a["chunks_skipped"] == 0

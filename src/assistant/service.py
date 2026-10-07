@@ -48,6 +48,26 @@ class UnifiedAssistantService:
         session_id = request.session_id or str(uuid.uuid4())
         session = self.store.get(session_id)
 
+        # Conversational greeting check: dynamically synthesize greeting via LLM with zero document citations
+        from src.rag.service import is_greeting
+        if is_greeting(request.message):
+            agent_response = await self._get_agent_service().chat(
+                AgentRequest(
+                    message=request.message,
+                    session_id=session_id,
+                    project_id=request.project_id or session.current_project_id,
+                    history=session.messages,
+                    preferred_route="direct",
+                )
+            )
+            return AssistantResponse(
+                answer=agent_response.answer,
+                route="direct",
+                session_id=session_id,
+                sources=[],
+                show_pdf=False,
+            )
+
         # Check if the user query specifically targets any registered document in the knowledge base
         from src.rag.service import detect_target_document_from_query
         target_doc_id = await detect_target_document_from_query(request.message, db)
