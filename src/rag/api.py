@@ -1,21 +1,42 @@
-"""
-FastAPI route handlers for chat interactions and company policy resources.
-Includes comprehensive logging, request timing, and robust error handling.
-"""
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.connection import get_db
-from src.rag.schema import ChatMessageResponse, ChatRequest, ChatResponse
-from src.rag.service import ChatService, POLICY_PAGES, generate_company_policy_pdf
+from src.rag.model import ChatSession
+from src.rag.schema import (
+    ChatMessageResponse,
+    ChatRequest,
+    ChatResponse,
+    DocumentDetailResponse,
+    DocumentInfoResponse,
+    DocumentUploadResponse,
+)
+from src.rag.service import (
+    ChatService,
+    ExtractionError,
+    POLICY_DOC_ID,
+    POLICY_FILENAME,
+    POLICY_PAGES,
+    delete_document,
+    generate_company_policy_pdf,
+    get_document_detail,
+    get_documents,
+    get_policy_file_path,
+    normalize_extracted_pdf_text,
+    process_document_upload,
+)
 
 logger = logging.getLogger("src.rag.api")
 router = APIRouter(prefix="/chat", tags=["chat"])
+documents_router = APIRouter(prefix="/documents", tags=["documents"])
+rag_router = APIRouter(prefix="/rag", tags=["rag"])
 
 
 @router.post(
@@ -55,6 +76,22 @@ async def chat_with_policy(
         ) from e
 
 
+@rag_router.post(
+    "/query",
+    response_model=ChatResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Execute RAG query with Qdrant vector retrieval and LLM generation",
+)
+async def query_rag_endpoint(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ChatResponse:
+    """
+    Submits user question to RAG pipeline via Qdrant similarity search and LLM synthesis.
+    """
+    return await chat_with_policy(request, db)
+
+
 @router.get(
     "/history",
     response_model=list[ChatMessageResponse],
@@ -68,6 +105,7 @@ async def chat_with_policy(
 )
 async def get_chat_history(
     document_id: str | None = None,
+    session_id: str | None = None,
     db: AsyncSession = Depends(get_db),
 ) -> list[ChatMessageResponse]:
     """
@@ -75,7 +113,13 @@ async def get_chat_history(
     """
     try:
         service = ChatService(db)
-        history = await service.get_history()
+        doc_uuid = None
+        if document_id:
+            try:
+                doc_uuid = uuid.UUID(document_id)
+            except Exception:
+                pass
+        history = await service.get_history(document_id=doc_uuid, session_id=session_id)
         logger.debug("Retrieved %d history items", len(history))
         return history
     except Exception as e:
@@ -83,6 +127,37 @@ async def get_chat_history(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve conversation history.",
+        ) from e
+
+
+@router.get(
+    "/sessions",
+    summary="Get all conversation sessions",
+)
+async def get_chat_sessions(
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """
+    Retrieves all chat sessions ordered by most recently updated.
+    """
+    try:
+        stmt = select(ChatSession).order_by(ChatSession.updated_at.desc())
+        res = await db.execute(stmt)
+        sessions = res.scalars().all()
+        return [
+            {
+                "id": s.id,
+                "title": s.title,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+            }
+            for s in sessions
+        ]
+    except Exception as e:
+        logger.error("Failed to fetch chat sessions: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve chat sessions.",
         ) from e
 
 
@@ -95,7 +170,7 @@ async def get_policy_pdf() -> FileResponse:
     Serves the official company policy PDF document for inline browser viewing.
     """
     try:
-        pdf_path = Path(__file__).resolve().parent.parent.parent / "data" / "WorkPilot_Company_Policy.pdf"
+        pdf_path = get_policy_file_path()
         if not pdf_path.exists():
             logger.info("PDF handbook not found on disk; generating fresh copy...")
             generate_company_policy_pdf(pdf_path)
@@ -107,13 +182,14 @@ async def get_policy_pdf() -> FileResponse:
                 detail="Policy PDF document not found.",
             )
 
+        fname = pdf_path.name
         return FileResponse(
             path=str(pdf_path),
             media_type="application/pdf",
-            filename="WorkPilot_Company_Policy.pdf",
+            filename=fname,
             content_disposition_type="inline",
             headers={
-                "Content-Disposition": 'inline; filename="WorkPilot_Company_Policy.pdf"',
+                "Content-Disposition": f'inline; filename="{fname}"',
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Expose-Headers": "Content-Disposition",
             },
@@ -137,3 +213,268 @@ async def get_policy_pages() -> dict[str, Any]:
     Returns structured page-by-page JSON policy data for client-side handbook viewer.
     """
     return {"pages": POLICY_PAGES}
+
+
+# ============================================================
+# DOCUMENT MANAGEMENT & INCREMENTAL UPLOAD ROUTERS
+# ============================================================
+
+@documents_router.post(
+    "/upload",
+    response_model=DocumentUploadResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Upload PDF, DOCX, or TXT for incremental RAG indexing",
+)
+@router.post(
+    "/upload",
+    response_model=DocumentUploadResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Upload PDF, DOCX, or TXT for incremental RAG indexing (chat alias)",
+    include_in_schema=False,
+)
+async def upload_document(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentUploadResponse:
+    """
+    Uploads a document (PDF, DOCX, TXT), performs structure-aware hybrid chunking,
+    computes deterministic chunk hashes, and incrementally embeds/indexes only modified chunks.
+    """
+    filename = file.filename or "uploaded_document.pdf"
+    logger.info("Received document upload request: '%s' (content_type=%s)", filename, file.content_type)
+
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Uploaded file '{filename}' is empty.",
+            )
+
+        upload_result = await process_document_upload(
+            file_bytes=file_bytes,
+            file_name=filename,
+            db=db,
+        )
+        logger.info(
+            "Document '%s' processed successfully: added=%d, updated=%d, skipped=%d, deleted=%d",
+            filename,
+            upload_result.chunks_added,
+            upload_result.chunks_updated,
+            upload_result.chunks_skipped,
+            upload_result.chunks_deleted,
+        )
+        return upload_result
+    except ExtractionError as e:
+        logger.warning("Extraction error for '%s': %s", filename, e)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to process document upload for '%s': %s", filename, e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred while indexing document '{filename}': {str(e)}",
+        ) from e
+
+
+@documents_router.get(
+    "",
+    response_model=list[DocumentInfoResponse],
+    summary="List all registered knowledge base documents",
+)
+async def list_documents(
+    db: AsyncSession = Depends(get_db),
+) -> list[DocumentInfoResponse]:
+    """
+    Returns list of all documents registered in the system along with their current status and chunk counts.
+    """
+    try:
+        docs = await get_documents(db)
+        return [
+            DocumentInfoResponse(
+                document_id=d.document_id,
+                file_name=d.file_name,
+                file_hash=d.file_hash,
+                file_type=d.file_type,
+                status=d.status,
+                chunk_count=d.chunk_count,
+                is_default=(d.document_id == POLICY_DOC_ID),
+                created_at=d.created_at,
+                updated_at=d.updated_at,
+            )
+            for d in docs
+        ]
+    except Exception as e:
+        logger.error("Failed to list documents: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve document registry.",
+        ) from e
+
+
+@documents_router.get(
+    "/{document_id}",
+    response_model=DocumentDetailResponse,
+    summary="Get document details and indexed chunk structure",
+)
+async def get_document(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> DocumentDetailResponse:
+    """
+    Retrieves full details for a document including its hybrid chunk hierarchy and content hashes.
+    """
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document UUID format.") from e
+
+    try:
+        doc, chunks = await get_document_detail(doc_uuid, db)
+        if not doc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document '{document_id}' not found.")
+
+        chunk_data = [
+            {
+                "chunk_id": c.chunk_id,
+                "section": c.section,
+                "topic": c.topic,
+                "chunk_index": c.chunk_index,
+                "page_number": c.page_number,
+                "content_hash": c.content_hash,
+                "content_preview": c.content[:160] + "..." if len(c.content) > 160 else c.content,
+            }
+            for c in chunks
+        ]
+        doc_info = DocumentInfoResponse(
+            document_id=doc.document_id,
+            file_name=doc.file_name,
+            file_hash=doc.file_hash,
+            file_type=doc.file_type,
+            status=doc.status,
+            chunk_count=doc.chunk_count,
+            is_default=(doc.document_id == POLICY_DOC_ID),
+            created_at=doc.created_at,
+            updated_at=doc.updated_at,
+        )
+        return DocumentDetailResponse(document=doc_info, chunks=chunk_data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to get document detail '%s': %s", document_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve document details.",
+        ) from e
+
+
+@documents_router.get(
+    "/{document_id}/pages",
+    summary="Get structured pages and contents of a document for handbook viewer",
+)
+async def get_document_pages_endpoint(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Returns structured page data for any document (default policy or uploaded document)
+    so the handbook viewer can render pages and sections seamlessly.
+    """
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document UUID.") from e
+
+    if doc_uuid == POLICY_DOC_ID:
+        return {
+            "document_id": str(POLICY_DOC_ID),
+            "file_name": POLICY_FILENAME,
+            "is_default": True,
+            "pages": POLICY_PAGES,
+        }
+
+    doc, chunks = await get_document_detail(doc_uuid, db)
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document '{document_id}' not found.")
+
+    # Group chunks by page_number
+    page_map: dict[int, list[dict[str, Any]]] = {}
+    for c in chunks:
+        pg = c.page_number or 1
+        if pg not in page_map:
+            page_map[pg] = []
+        normalized_content = normalize_extracted_pdf_text(c.content) if c.content else ""
+        page_map[pg].append({
+            "chunk_id": c.chunk_id,
+            "section": c.section or "Section",
+            "topic": c.topic or "General",
+            "content": normalized_content or c.content,
+        })
+
+    structured_pages = []
+    for pg_num in sorted(page_map.keys()):
+        chk_list = page_map[pg_num]
+        sec_names = list(dict.fromkeys(chk["section"] for chk in chk_list if chk["section"]))
+        full_page_text = "\n\n".join(chk["content"] for chk in chk_list)
+        title = sec_names[0] if sec_names else f"Page {pg_num}"
+        structured_pages.append({
+            "page_number": pg_num,
+            "title": title,
+            "sections": sec_names,
+            "content": full_page_text,
+            "chunks": chk_list,
+        })
+
+    if not structured_pages:
+        structured_pages = [{
+            "page_number": 1,
+            "title": doc.file_name,
+            "sections": [],
+            "content": "No textual content available for this document.",
+        }]
+
+    return {
+        "document_id": str(doc.document_id),
+        "file_name": doc.file_name,
+        "is_default": False,
+        "pages": structured_pages,
+    }
+
+
+@documents_router.delete(
+    "/{document_id}",
+    summary="Delete a document and purge its vectors from index",
+)
+async def delete_doc(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Deletes a document from registry and purges all corresponding vectors from vector store.
+    """
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document UUID format.") from e
+
+    if doc_uuid == POLICY_DOC_ID:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The default company policy document is protected and cannot be deleted.",
+        )
+
+    try:
+        deleted = await delete_document(doc_uuid, db)
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document '{document_id}' not found.")
+        return {"deleted": True, "document_id": document_id, "message": f"Document '{document_id}' and all vectors deleted."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to delete document '%s': %s", document_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete document.",
+        ) from e
+

@@ -47,10 +47,93 @@ class UnifiedAssistantService:
     ) -> AssistantResponse:
         session_id = request.session_id or str(uuid.uuid4())
         session = self.store.get(session_id)
+
+        # Conversational greeting check: dynamically synthesize greeting via LLM with zero document citations
+        from src.rag.service import is_greeting
+        if is_greeting(request.message):
+            agent_response = await self._get_agent_service().chat(
+                AgentRequest(
+                    message=request.message,
+                    session_id=session_id,
+                    project_id=request.project_id or session.current_project_id,
+                    history=session.messages,
+                    preferred_route="direct",
+                )
+            )
+            return AssistantResponse(
+                answer=agent_response.answer,
+                route="direct",
+                session_id=session_id,
+                sources=[],
+                show_pdf=False,
+            )
+
+        # Check if the user query specifically targets any registered document in the knowledge base
+        target_doc_id = None
+        try:
+            from src.rag.service import detect_target_document_from_query
+            target_doc_id = await detect_target_document_from_query(request.message, db)
+        except Exception:
+            pass
+
+        actual_message = request.message
+        # If user replied with just a document name or selection in response to a document clarification:
+        if target_doc_id and len(request.message.split()) <= 6:
+            prev_msgs = list(session.messages) if session.messages else []
+            last_asst = next(
+                (m for m in reversed(prev_msgs) if getattr(m, "role", "") == "assistant" or (isinstance(m, dict) and m.get("role") == "assistant")),
+                None,
+            )
+            last_asst_text = (getattr(last_asst, "content", "") if last_asst else "") or (last_asst.get("content", "") if isinstance(last_asst, dict) else "")
+            if "specify which document" in last_asst_text.lower() or "multiple documents" in last_asst_text.lower():
+                last_user = next(
+                    (m for m in reversed(prev_msgs) if (getattr(m, "role", "") == "user" or (isinstance(m, dict) and m.get("role") == "user")) and (getattr(m, "content", "") if not isinstance(m, dict) else m.get("content", "")) != request.message),
+                    None,
+                )
+                if last_user:
+                    orig_q = getattr(last_user, "content", "") if not isinstance(last_user, dict) else last_user.get("content", "")
+                    if orig_q:
+                        actual_message = orig_q
+
+        if target_doc_id:
+            logger.info(
+                "Unified assistant request session_id=%s targets document %s for message: '%s'",
+                session_id,
+                target_doc_id,
+                actual_message,
+            )
+            if self.rag_service_factory is None:
+                from src.rag.service import ChatService
+                self.rag_service_factory = ChatService
+            response = await self.rag_service_factory(db).chat(
+                ChatRequest(
+                    message=actual_message,
+                    session_id=session_id,
+                    document_id=str(target_doc_id),
+                    history=session.messages,
+                )
+            )
+            self.store.append(session_id, request.message, response.answer, session.current_project_id)
+            return AssistantResponse(
+                answer=response.answer,
+                route="policy",
+                session_id=session_id,
+                sources=response.sources,
+                show_pdf=response.show_pdf,
+            )
+
+        try:
+            from src.rag.service import get_documents
+            docs = await get_documents(db)
+            known_doc_names = [d.file_name for d in docs if d.file_name]
+        except Exception:
+            known_doc_names = []
+
         decision = classify_request(
             request.message,
             current_project_id=session.current_project_id,
             explicit_project_id=request.project_id,
+            known_documents=known_doc_names,
         )
         logger.info(
             "Unified assistant request session_id=%s route=%s message=%s",
@@ -68,10 +151,79 @@ class UnifiedAssistantService:
                 session_id=session_id,
             )
 
+        # Check for matching chunks across the knowledge base
+        matching_chunks = []
+        if self.rag_service_factory is None:
+            try:
+                from src.rag.service import retrieve_relevant_chunks
+                matching_chunks = await retrieve_relevant_chunks(
+                    query=request.message,
+                    chat_history=session.messages,
+                )
+            except Exception as e:
+                logger.warning("Knowledge base retrieval check skipped: %s", e)
+
+        # Multi-document disambiguation check:
+        # If the search matches two or more distinct documents and the user hasn't specified which one,
+        # ask the user to clarify and list the candidate documents below.
+        distinct_docs: dict[str, str] = {}
+        for chk in (matching_chunks or []):
+            d_id = str(chk.metadata.get("document_id") or "")
+            fname = chk.metadata.get("filename") or chk.metadata.get("file_name") or ""
+            if d_id and fname:
+                distinct_docs[d_id] = fname
+
+        if len(distinct_docs) >= 2:
+            from src.rag.schema import SourceChunk
+            doc_bullets = "\n".join([f"• **{fname}**" for fname in distinct_docs.values()])
+            clarification_answer = (
+                "Your question matches information found in multiple documents in the knowledge base.\n\n"
+                "Please specify which document you would like to consult:\n"
+                f"{doc_bullets}\n\n"
+                "You can select or type the document name to see the exact answer."
+            )
+            self.store.append(session_id, request.message, clarification_answer, session.current_project_id)
+            return AssistantResponse(
+                answer=clarification_answer,
+                route="clarification",
+                session_id=session_id,
+                sources=[
+                    SourceChunk(
+                        filename=fname,
+                        document_id=did,
+                        page=1,
+                        chunk_index=0,
+                    )
+                    for did, fname in distinct_docs.items()
+                ],
+                show_pdf=False,
+            )
+
         if decision.route == "policy":
             if self.rag_service_factory is None:
                 # Lazy import keeps agent-only tests independent of the existing
                 # RAG provider imports while preserving the existing service.
+                from src.rag.service import ChatService
+
+                self.rag_service_factory = ChatService
+            response = await self.rag_service_factory(db).chat(
+                ChatRequest(
+                    message=request.message,
+                    session_id=session_id,
+                    history=session.messages,
+                )
+            )
+            self.store.append(session_id, request.message, response.answer, session.current_project_id)
+            return AssistantResponse(
+                answer=response.answer,
+                route="policy",
+                session_id=session_id,
+                sources=response.sources,
+                show_pdf=response.show_pdf,
+            )
+
+        if decision.route == "direct" and matching_chunks:
+            if self.rag_service_factory is None:
                 from src.rag.service import ChatService
 
                 self.rag_service_factory = ChatService

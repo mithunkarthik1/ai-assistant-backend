@@ -103,3 +103,31 @@ async def test_unified_service_delegates_project_requests_to_agent():
     assert agent.requests[0].preferred_route == "project_api"
     assert agent.requests[0].project_id == "PROJ-123"
     assert rag.requests == []
+
+
+@pytest.mark.asyncio
+async def test_unified_service_handles_greetings_dynamically_without_sources():
+    rag = FakeRagService()
+    agent = FakeAgentService()
+    service = UnifiedAssistantService(
+        AgentSettings(),
+        store=ConversationStore(),
+        agent_service=agent,
+        rag_service_factory=lambda db: rag,
+    )
+
+    response = await service.chat(
+        AssistantRequest(
+            message="hi",
+            session_id="greeting-session",
+        ),
+        SimpleNamespace(),
+    )
+
+    assert response.route == "direct"
+    assert response.sources == []
+    assert response.show_pdf is False
+    assert response.answer == "Direct answer"
+    assert len(agent.requests) == 1
+    assert agent.requests[0].preferred_route == "direct"
+    assert rag.requests == []

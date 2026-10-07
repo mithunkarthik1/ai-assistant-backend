@@ -105,23 +105,25 @@ class AgentLLM:
             "project_api_error": tool_error,
         }
         prompt = (
-            "Answer the user's request clearly and concisely. Use only the Project API result for "
+            "Answer the user's request clearly, naturally, and concisely. Use only the Project API result for "
             "project-specific facts. If the Project API failed or data is missing, explain that "
-            "without inventing project details. If this is a general request, answer directly.\n\n"
+            "without inventing project details. If this is a greeting or general conversational request, respond warmly, naturally, and helpfully without inventing project details.\n\n"
             f"Agent context: {json.dumps(context, ensure_ascii=False, default=str)}\n"
             f"User request: {request}"
         )
         answer = await self._invoke(
-            "You are WorkPilot's general-purpose project assistant.",
+            "You are WorkPilot, an intelligent workplace AI assistant that helps users with their projects, tasks, and documents.",
             prompt,
+            temperature=0.6,
         )
         if not answer.strip():
             raise AgentResponseError("The LLM returned an empty response.")
         return answer.strip()
 
-    async def _invoke(self, system_prompt: str, human_prompt: str) -> str:
+    async def _invoke(self, system_prompt: str, human_prompt: str, temperature: float | None = None) -> str:
         try:
-            response = await self.model.ainvoke([
+            model = self.model if temperature is None else self.model.bind(temperature=temperature)
+            response = await model.ainvoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=human_prompt),
             ])
@@ -316,6 +318,12 @@ class ProjectAgentGraph:
         return workflow.compile()
 
     async def _decide(self, state: AgentGraphState) -> dict[str, Any]:
+        preferred_route = state.get("preferred_route")
+        if preferred_route == "direct":
+            decision = AgentDecision(route="direct", rationale="Direct LLM route explicitly requested.")
+            logger.info("Agent decision route=direct (short-circuit)")
+            return {"decision": decision, "project_id": state.get("project_id") or state.get("current_project_id")}
+
         decision = await self.llm.decide(
             request=state["request"],
             conversation=state.get("conversation", []),
@@ -325,10 +333,7 @@ class ProjectAgentGraph:
         if project_id and decision.project_id != project_id:
             decision = decision.model_copy(update={"project_id": project_id})
 
-        preferred_route = state.get("preferred_route")
-        if preferred_route == "direct":
-            decision = decision.model_copy(update={"route": "direct", "operation": None})
-        elif preferred_route == "project_api":
+        if preferred_route == "project_api":
             decision = decision.model_copy(update={"route": "project_api"})
         logger.info(
             "Agent decision route=%s operation=%s project_id=%s rationale=%s",
