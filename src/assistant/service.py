@@ -34,11 +34,18 @@ class UnifiedAssistantService:
         self.store = store or ConversationStore(max_messages=agent_settings.memory_max_messages)
         self._agent_service = agent_service
         self.rag_service_factory = rag_service_factory
+        self._is_mock_rag = rag_service_factory is not None
 
     def _get_agent_service(self) -> AgentService:
         if self._agent_service is None:
             self._agent_service = create_agent_service(self.agent_settings, store=self.store)
         return self._agent_service
+
+    def _get_rag_factory(self) -> Callable[[AsyncSession], Any]:
+        if self.rag_service_factory is not None:
+            return self.rag_service_factory
+        from src.rag.service import ChatService
+        return ChatService
 
     async def chat(
         self,
@@ -47,6 +54,7 @@ class UnifiedAssistantService:
     ) -> AssistantResponse:
         session_id = request.session_id or str(uuid.uuid4())
         session = self.store.get(session_id)
+        rag_factory = self._get_rag_factory()
 
         # Conversational greeting check: dynamically synthesize greeting via LLM with zero document citations
         from src.rag.service import is_greeting
@@ -102,10 +110,7 @@ class UnifiedAssistantService:
                 target_doc_id,
                 actual_message,
             )
-            if self.rag_service_factory is None:
-                from src.rag.service import ChatService
-                self.rag_service_factory = ChatService
-            response = await self.rag_service_factory(db).chat(
+            response = await rag_factory(db).chat(
                 ChatRequest(
                     message=actual_message,
                     session_id=session_id,
@@ -153,7 +158,7 @@ class UnifiedAssistantService:
 
         # Check for matching chunks across the knowledge base
         matching_chunks = []
-        if self.rag_service_factory is None:
+        if not self._is_mock_rag and not is_greeting(request.message):
             try:
                 from src.rag.service import retrieve_relevant_chunks
                 matching_chunks = await retrieve_relevant_chunks(
@@ -164,49 +169,23 @@ class UnifiedAssistantService:
                 logger.warning("Knowledge base retrieval check skipped: %s", e)
 
         # Multi-document disambiguation check:
-        # If the search matches two or more distinct documents and the user hasn't specified which one,
-        # ask the user to clarify and list the candidate documents below.
-        distinct_docs: dict[str, str] = {}
-        for chk in (matching_chunks or []):
-            d_id = str(chk.metadata.get("document_id") or "")
-            fname = chk.metadata.get("filename") or chk.metadata.get("file_name") or ""
-            if d_id and fname:
-                distinct_docs[d_id] = fname
-
-        if len(distinct_docs) >= 2:
-            from src.rag.schema import SourceChunk
-            doc_bullets = "\n".join([f"• **{fname}**" for fname in distinct_docs.values()])
-            clarification_answer = (
-                "Your question matches information found in multiple documents in the knowledge base.\n\n"
-                "Please specify which document you would like to consult:\n"
-                f"{doc_bullets}\n\n"
-                "You can select or type the document name to see the exact answer."
-            )
-            self.store.append(session_id, request.message, clarification_answer, session.current_project_id)
-            return AssistantResponse(
-                answer=clarification_answer,
-                route="clarification",
-                session_id=session_id,
-                sources=[
-                    SourceChunk(
-                        filename=fname,
-                        document_id=did,
-                        page=1,
-                        chunk_index=0,
-                    )
-                    for did, fname in distinct_docs.items()
-                ],
-                show_pdf=False,
-            )
+        # Only ask when genuinely competing documents are found within margin and threshold
+        if matching_chunks:
+            from src.rag.service import get_competing_documents, format_clarification_message
+            competing = get_competing_documents(matching_chunks, request.message)
+            if competing:
+                clarification_answer = format_clarification_message(competing)
+                self.store.append(session_id, request.message, clarification_answer, session.current_project_id)
+                return AssistantResponse(
+                    answer=clarification_answer,
+                    route="clarification",
+                    session_id=session_id,
+                    sources=[],
+                    show_pdf=False,
+                )
 
         if decision.route == "policy":
-            if self.rag_service_factory is None:
-                # Lazy import keeps agent-only tests independent of the existing
-                # RAG provider imports while preserving the existing service.
-                from src.rag.service import ChatService
-
-                self.rag_service_factory = ChatService
-            response = await self.rag_service_factory(db).chat(
+            response = await rag_factory(db).chat(
                 ChatRequest(
                     message=request.message,
                     session_id=session_id,
@@ -223,11 +202,7 @@ class UnifiedAssistantService:
             )
 
         if decision.route == "direct" and matching_chunks:
-            if self.rag_service_factory is None:
-                from src.rag.service import ChatService
-
-                self.rag_service_factory = ChatService
-            response = await self.rag_service_factory(db).chat(
+            response = await rag_factory(db).chat(
                 ChatRequest(
                     message=request.message,
                     session_id=session_id,

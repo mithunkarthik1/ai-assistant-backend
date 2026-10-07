@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     Application lifespan handling database initialization, Qdrant collection setup, and vector indexing.
     Gracefully handles environments where PostgreSQL is not running locally.
     """
-    logger.info("Initializing WorkPilot AI Assistant backend...")
+    logger.info("Initializing AI Assistant backend...")
 
     # 1. Database schema initialization
     try:

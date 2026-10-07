@@ -299,7 +299,7 @@ async def list_documents(
                 file_type=d.file_type,
                 status=d.status,
                 chunk_count=d.chunk_count,
-                is_default=(d.document_id == POLICY_DOC_ID),
+                is_default=(d.document_id == POLICY_DOC_ID or d.file_name == POLICY_FILENAME),
                 created_at=d.created_at,
                 updated_at=d.updated_at,
             )
@@ -386,9 +386,9 @@ async def get_document_pages_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document UUID.") from e
 
-    if doc_uuid == POLICY_DOC_ID:
+    if doc_uuid == POLICY_DOC_ID or str(doc_uuid) == "00000000-0000-0000-0000-000000000002":
         return {
-            "document_id": str(POLICY_DOC_ID),
+            "document_id": str(doc_uuid),
             "file_name": POLICY_FILENAME,
             "is_default": True,
             "pages": POLICY_PAGES,
@@ -397,6 +397,14 @@ async def get_document_pages_endpoint(
     doc, chunks = await get_document_detail(doc_uuid, db)
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document '{document_id}' not found.")
+
+    if doc.file_name == POLICY_FILENAME:
+        return {
+            "document_id": str(doc.document_id),
+            "file_name": POLICY_FILENAME,
+            "is_default": True,
+            "pages": POLICY_PAGES,
+        }
 
     # Group chunks by page_number
     page_map: dict[int, list[dict[str, Any]]] = {}
@@ -458,7 +466,7 @@ async def delete_doc(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document UUID format.") from e
 
-    if doc_uuid == POLICY_DOC_ID:
+    if doc_uuid == POLICY_DOC_ID or str(doc_uuid) == "00000000-0000-0000-0000-000000000002":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The default company policy document is protected and cannot be deleted.",
