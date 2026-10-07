@@ -13,6 +13,7 @@ class SourceChunk(BaseModel):
     section: str | None = None
     topic: str | None = None
     chunk_id: str | None = None
+    document_id: str | None = None
 
 
 class ChatRequest(BaseModel):
