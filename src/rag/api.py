@@ -5,9 +5,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.connection import get_db
+from src.rag.model import ChatSession
 from src.rag.schema import (
     ChatMessageResponse,
     ChatRequest,
@@ -20,12 +22,14 @@ from src.rag.service import (
     ChatService,
     ExtractionError,
     POLICY_DOC_ID,
+    POLICY_FILENAME,
     POLICY_PAGES,
     delete_document,
     generate_company_policy_pdf,
     get_document_detail,
     get_documents,
     get_policy_file_path,
+    normalize_extracted_pdf_text,
     process_document_upload,
 )
 
@@ -123,6 +127,37 @@ async def get_chat_history(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve conversation history.",
+        ) from e
+
+
+@router.get(
+    "/sessions",
+    summary="Get all conversation sessions",
+)
+async def get_chat_sessions(
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """
+    Retrieves all chat sessions ordered by most recently updated.
+    """
+    try:
+        stmt = select(ChatSession).order_by(ChatSession.updated_at.desc())
+        res = await db.execute(stmt)
+        sessions = res.scalars().all()
+        return [
+            {
+                "id": s.id,
+                "title": s.title,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+            }
+            for s in sessions
+        ]
+    except Exception as e:
+        logger.error("Failed to fetch chat sessions: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve chat sessions.",
         ) from e
 
 
@@ -332,6 +367,79 @@ async def get_document(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve document details.",
         ) from e
+
+
+@documents_router.get(
+    "/{document_id}/pages",
+    summary="Get structured pages and contents of a document for handbook viewer",
+)
+async def get_document_pages_endpoint(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Returns structured page data for any document (default policy or uploaded document)
+    so the handbook viewer can render pages and sections seamlessly.
+    """
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document UUID.") from e
+
+    if doc_uuid == POLICY_DOC_ID:
+        return {
+            "document_id": str(POLICY_DOC_ID),
+            "file_name": POLICY_FILENAME,
+            "is_default": True,
+            "pages": POLICY_PAGES,
+        }
+
+    doc, chunks = await get_document_detail(doc_uuid, db)
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document '{document_id}' not found.")
+
+    # Group chunks by page_number
+    page_map: dict[int, list[dict[str, Any]]] = {}
+    for c in chunks:
+        pg = c.page_number or 1
+        if pg not in page_map:
+            page_map[pg] = []
+        normalized_content = normalize_extracted_pdf_text(c.content) if c.content else ""
+        page_map[pg].append({
+            "chunk_id": c.chunk_id,
+            "section": c.section or "Section",
+            "topic": c.topic or "General",
+            "content": normalized_content or c.content,
+        })
+
+    structured_pages = []
+    for pg_num in sorted(page_map.keys()):
+        chk_list = page_map[pg_num]
+        sec_names = list(dict.fromkeys(chk["section"] for chk in chk_list if chk["section"]))
+        full_page_text = "\n\n".join(chk["content"] for chk in chk_list)
+        title = sec_names[0] if sec_names else f"Page {pg_num}"
+        structured_pages.append({
+            "page_number": pg_num,
+            "title": title,
+            "sections": sec_names,
+            "content": full_page_text,
+            "chunks": chk_list,
+        })
+
+    if not structured_pages:
+        structured_pages = [{
+            "page_number": 1,
+            "title": doc.file_name,
+            "sections": [],
+            "content": "No textual content available for this document.",
+        }]
+
+    return {
+        "document_id": str(doc.document_id),
+        "file_name": doc.file_name,
+        "is_default": False,
+        "pages": structured_pages,
+    }
 
 
 @documents_router.delete(

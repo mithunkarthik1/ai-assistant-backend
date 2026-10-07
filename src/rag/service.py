@@ -31,7 +31,13 @@ from src.core.config import settings
 from src.database.connection import engine
 from src.database.qdrant import chunk_id_to_qdrant_id, qdrant_service
 from qdrant_client.models import PointStruct
-from src.rag.model import ChatMessage, DEFAULT_DOC_ID, Document as DocumentModel, DocumentChunk
+from src.rag.model import (
+    ChatMessage,
+    ChatSession,
+    DEFAULT_DOC_ID,
+    Document as DocumentModel,
+    DocumentChunk,
+)
 from src.rag.schema import (
     ChatRequest,
     ChatResponse,
@@ -53,6 +59,72 @@ POLICY_FILENAME = Path(settings.policy_file_path).name
 class ExtractionError(Exception):
     """Raised when text extraction from a file fails."""
     pass
+
+
+def normalize_extracted_pdf_text(text: str) -> str:
+    """
+    Normalizes text extracted from PDF pages.
+    PDF text extractors often emit words separated by newlines (\n or \n\n)
+    or break sentences unnaturally. This function un-wraps fragmented words
+    into clean, flowing sentences and paragraphs while preserving legitimate
+    bullet points and headings.
+    """
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+
+    raw_lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not raw_lines:
+        return ""
+
+    output_blocks: list[str] = []
+    current_block: list[str] = []
+    pending_bullet = False
+
+    for line in raw_lines:
+        # Standalone bullet symbol
+        if line in ("●", "○", "•", "■", "◆", "►"):
+            if current_block:
+                output_blocks.append(" ".join(current_block))
+                current_block = []
+            pending_bullet = True
+            continue
+
+        is_bullet = line.startswith(("●", "○", "•", "■", "◆", "►")) or bool(re.match(r"^\d+[\.\)]\s", line))
+        is_heading = (line.endswith(":") and len(line.split()) <= 8) or bool(re.match(r"^(?:Section|Article|Chapter)\s+\d+", line, re.I))
+
+        if pending_bullet:
+            pending_bullet = False
+            line = "• " + line.lstrip("●○•■◆►- ")
+            is_bullet = True
+
+        if is_bullet:
+            if current_block:
+                output_blocks.append(" ".join(current_block))
+                current_block = []
+            current_block.append(line)
+        elif is_heading:
+            if current_block:
+                output_blocks.append(" ".join(current_block))
+                current_block = []
+            output_blocks.append(line)
+        else:
+            current_block.append(line)
+
+    if current_block:
+        output_blocks.append(" ".join(current_block))
+
+    final_blocks: list[str] = []
+    for b in output_blocks:
+        b_clean = b.strip()
+        if not b_clean:
+            continue
+        b_clean = re.sub(r"^[●○■◆►]\s*", "• ", b_clean)
+        b_clean = re.sub(r"\s+\d+$", "", b_clean)
+        final_blocks.append(b_clean)
+
+    return "\n\n".join(final_blocks)
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
@@ -77,9 +149,10 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
         pages_data: list[dict[str, Any]] = []
         for idx, page in enumerate(reader.pages):
             page_text = page.extract_text() or ""
+            clean_text = normalize_extracted_pdf_text(page_text)
             pages_data.append({
                 "page_number": idx + 1,
-                "text": page_text,
+                "text": clean_text if clean_text else page_text,
             })
 
         total_extracted = sum(len(p["text"].strip()) for p in pages_data)
@@ -253,6 +326,43 @@ def calculate_content_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+INVALID_TOPIC_WORDS = {
+    "are", "is", "was", "were", "be", "been", "being",
+    "have", "has", "had", "having",
+    "do", "does", "did",
+    "can", "could", "shall", "should", "will", "would", "may", "might", "must",
+    "ex", "eg", "e.g", "e.g.", "ie", "i.e", "i.e.", "etc", "etc.",
+    "case", "example", "examples", "note", "notes",
+    "and", "or", "but", "for", "nor", "so", "yet",
+    "to", "of", "in", "on", "at", "by", "with", "from", "as",
+    "the", "a", "an", "this", "that", "these", "those",
+    "such as", "as follows", "including", "given under",
+    "details", "general", "overview", "introduction", "section", "part",
+    "30-day", "day", "days", "clause",
+}
+
+
+def is_valid_topic_name(title: str | None) -> bool:
+    """Checks if a string is a legitimate semantic topic or section name."""
+    if not title:
+        return False
+    clean = title.strip().rstrip(":")
+    if len(clean) < 3:
+        return False
+    # Pure numbers or symbols
+    if clean.isdigit() or re.match(r"^[\d.\-_/\\:]+$", clean):
+        return False
+    clean_lower = clean.lower()
+    if clean_lower in INVALID_TOPIC_WORDS:
+        return False
+    words = clean_lower.split()
+    if len(words) == 1 and words[0] in INVALID_TOPIC_WORDS:
+        return False
+    if words and words[0] in ("are", "is", "was", "were", "and", "or", "to", "for", "in", "with", "by", "from"):
+        return False
+    return True
+
+
 def is_heading(line: str) -> tuple[bool, int, str]:
     """
     Detects if a text line is a section or topic heading.
@@ -267,25 +377,86 @@ def is_heading(line: str) -> tuple[bool, int, str]:
     if md_match:
         level = len(md_match.group(1))
         title = md_match.group(2).strip()
-        return True, level, title
+        if is_valid_topic_name(title):
+            return True, level, title
 
     # 2. Numbered headings (e.g. '1. Working Hours', 'Section 2: Remote Work', 'Article 3 - Leave')
-    numbered_match = re.match(r"^(?:Section\s+|Article\s+)?(\d+(?:\.\d+)*)[:.\-\s]+\s*([A-Za-z].+)$", stripped, re.IGNORECASE)
+    numbered_match = re.match(
+        r"^(?:Section\s+|Article\s+)?(\d+(?:\.\d+)*)[:.\-\s]+\s*([A-Za-z].+)$",
+        stripped,
+        re.IGNORECASE,
+    )
     if numbered_match:
-        num_parts = numbered_match.group(1).split(".")
-        level = min(len(num_parts) + 1, 4)
-        title = stripped
-        return True, level, title
+        title = numbered_match.group(2).strip().rstrip(":")
+        if is_valid_topic_name(title):
+            num_parts = numbered_match.group(1).split(".")
+            level = min(len(num_parts) + 1, 4)
+            return True, level, f"{numbered_match.group(1)}. {title}"
 
-    # 3. Standalone UPPERCASE heading (at least 3 words or 12 chars, not a sentence)
-    if stripped.isupper() and len(stripped) >= 8 and not stripped.endswith((".", ":", ";")):
-        return True, 1, stripped.title()
+    # 3. Standalone UPPERCASE heading (at least 8 chars, not ending in period)
+    if stripped.isupper() and len(stripped) >= 8 and not stripped.endswith((".", ";")):
+        title = stripped.rstrip(":").title()
+        if is_valid_topic_name(title):
+            return True, 1, title
 
-    # 4. Heading ending with colon without terminal period and short length
+    # 4. Heading ending with colon without terminal period and reasonable length
     if stripped.endswith(":") and len(stripped.split()) <= 8 and not any(p in stripped for p in [".", "?", "!"]):
-        return True, 2, stripped.rstrip(":")
+        raw_title = stripped.rstrip(":").strip()
+        if is_valid_topic_name(raw_title) and (raw_title[0].isupper() or raw_title[0].isdigit()):
+            # Substantial headings (<= 5 words) get level 1, longer get level 2
+            return True, 1 if len(raw_title.split()) <= 5 else 2, raw_title
 
     return False, 0, ""
+
+
+def extract_topic_from_content(
+    content: str,
+    default_topic: str,
+    section_name: str,
+) -> str:
+    """
+    Extracts or refines the most specific, accurate topic for a chunk.
+    If default_topic is invalid or generic (e.g. 'are', 'ex', 'General', 'Details'),
+    scans content lines to extract a genuine topic.
+    """
+    if is_valid_topic_name(default_topic) and default_topic not in ("General", "Details", "Introduction"):
+        return default_topic
+
+    lines = [ln.strip() for ln in content.split("\n") if ln.strip()]
+    if not lines:
+        return section_name if is_valid_topic_name(section_name) else "General"
+
+    # 1. Check for bullet headers: e.g. "• Casual Leave (CL)" or "• Sick Leave (SL)"
+    for line in lines[:8]:
+        bullet_m = re.match(
+            r"^[-*•\d.]+\s*(?:\*\*(.+?)\*\*|([A-Z][A-Za-z0-9\s/&()\-]+?)(?::|$))\s*",
+            line,
+        )
+        if bullet_m:
+            candidate = (bullet_m.group(1) or bullet_m.group(2) or "").strip().rstrip(":")
+            if is_valid_topic_name(candidate) and len(candidate.split()) <= 5:
+                return candidate
+
+        is_h, _, h_title = is_heading(line)
+        if is_h and is_valid_topic_name(h_title):
+            return h_title
+
+    # 2. Check for sentence subject in first line:
+    first_line = lines[0]
+    subject_m = re.match(
+        r"^([A-Z][A-Za-z0-9\s/&()\-]{3,35})\s+(?:is|are|will|must|should|can|cannot|applies|covers|refers)\b",
+        first_line,
+    )
+    if subject_m:
+        cand = subject_m.group(1).strip()
+        if is_valid_topic_name(cand) and len(cand.split()) <= 4:
+            return cand
+
+    # Fall back to section name if valid, otherwise "General"
+    if is_valid_topic_name(section_name) and section_name not in ("Overview", "Document"):
+        return section_name
+
+    return "General"
 
 
 def hybrid_chunk_pages(
@@ -334,8 +505,12 @@ def hybrid_chunk_pages(
             if not block_text:
                 return
 
-            sec_slug = slugify(section_name, max_words=3)
-            top_slug = slugify(topic_name, max_words=3)
+            # Refine topic and ensure clean semantic hierarchy
+            refined_topic = extract_topic_from_content(block_text, topic_name, section_name)
+            refined_section = section_name if is_valid_topic_name(section_name) else (refined_topic or "Overview")
+
+            sec_slug = slugify(refined_section, max_words=3)
+            top_slug = slugify(refined_topic, max_words=3)
             group_key = f"{sec_slug}_{top_slug}"
 
             if len(block_text) <= target_chunk_size + 150:
@@ -349,8 +524,8 @@ def hybrid_chunk_pages(
                     "document_id": str(document_id),
                     "filename": file_name,
                     "chunk_id": chunk_id,
-                    "section": section_name,
-                    "topic": topic_name,
+                    "section": refined_section,
+                    "topic": refined_topic,
                     "chunk_index": global_chunk_idx,
                     "page": page,
                     "content_hash": c_hash,
@@ -360,8 +535,8 @@ def hybrid_chunk_pages(
                     HybridChunk(
                         chunk_id=chunk_id,
                         document_id=document_id,
-                        section=section_name,
-                        topic=topic_name,
+                        section=refined_section,
+                        topic=refined_topic,
                         chunk_index=global_chunk_idx,
                         content=block_text,
                         content_hash=c_hash,
@@ -377,18 +552,23 @@ def hybrid_chunk_pages(
                     if not sub_t_clean:
                         continue
 
-                    topic_counter = topic_chunk_counters.get(group_key, 0) + 1
-                    topic_chunk_counters[group_key] = topic_counter
+                    # Further refine topic for sub-chunk if it focuses on a specific sub-clause
+                    sub_topic = extract_topic_from_content(sub_t_clean, refined_topic, refined_section)
+                    sub_top_slug = slugify(sub_topic, max_words=3)
+                    sub_group_key = f"{sec_slug}_{sub_top_slug}"
 
-                    chunk_id = f"doc_{short_doc_id}_{sec_slug}_{top_slug}_{topic_counter:03d}"
+                    topic_counter = topic_chunk_counters.get(sub_group_key, 0) + 1
+                    topic_chunk_counters[sub_group_key] = topic_counter
+
+                    chunk_id = f"doc_{short_doc_id}_{sec_slug}_{sub_top_slug}_{topic_counter:03d}"
                     c_hash = calculate_content_hash(sub_t_clean)
 
                     meta = {
                         "document_id": str(document_id),
                         "filename": file_name,
                         "chunk_id": chunk_id,
-                        "section": section_name,
-                        "topic": topic_name,
+                        "section": refined_section,
+                        "topic": sub_topic,
                         "chunk_index": global_chunk_idx,
                         "page": page,
                         "content_hash": c_hash,
@@ -398,8 +578,8 @@ def hybrid_chunk_pages(
                         HybridChunk(
                             chunk_id=chunk_id,
                             document_id=document_id,
-                            section=section_name,
-                            topic=topic_name,
+                            section=refined_section,
+                            topic=sub_topic,
                             chunk_index=global_chunk_idx,
                             content=sub_t_clean,
                             content_hash=c_hash,
@@ -417,18 +597,13 @@ def hybrid_chunk_pages(
                 continue
 
             is_head, level, title = is_heading(trimmed)
-            if is_head:
+            if is_head and is_valid_topic_name(title):
                 flush_block(current_section, current_topic, page_num)
 
-                if level == 1:
+                # Major heading updates both section & topic; sub-heading updates topic
+                if level == 1 or current_section in ("Overview", "Document"):
                     current_section = title
-                    current_topic = "General"
-                elif level == 2:
-                    if current_section == "Overview":
-                        current_section = title
-                        current_topic = "Details"
-                    else:
-                        current_topic = title
+                    current_topic = title
                 else:
                     current_topic = title
 
@@ -436,10 +611,10 @@ def hybrid_chunk_pages(
             else:
                 bullet_clause = re.match(r"^[-*•\d.]+\s*(?:\*\*(.+?)\*\*|([A-Za-z0-9\s/&]+):)\s*(.+)$", trimmed)
                 if bullet_clause and len(current_block) > 4:
-                    flush_block(current_section, current_topic, page_num)
-                    item_topic = bullet_clause.group(1) or bullet_clause.group(2)
-                    if item_topic and len(item_topic.split()) <= 4:
-                        current_topic = item_topic.strip()
+                    item_topic = (bullet_clause.group(1) or bullet_clause.group(2) or "").strip()
+                    if is_valid_topic_name(item_topic) and len(item_topic.split()) <= 4:
+                        flush_block(current_section, current_topic, page_num)
+                        current_topic = item_topic
 
                 current_block.append(trimmed)
 
@@ -1095,11 +1270,14 @@ async def retrieve_relevant_chunks(
             if document_id:
                 filters["document_id"] = str(document_id)
 
+            # When querying a specific targeted document, relax threshold so we retrieve its content
+            search_threshold = 0.05 if document_id else threshold
+
             qdrant_results = qdrant_service.search(
                 query_vector=q_vec,
                 limit=k * 3,
                 filters=filters if filters else None,
-                score_threshold=threshold,
+                score_threshold=search_threshold,
             )
 
             if qdrant_results:
@@ -1142,7 +1320,10 @@ async def retrieve_relevant_chunks(
                     score = float(pt.score)
 
                     # Authoritative PostgreSQL content
-                    if cid in db_chunks:
+                    if db_chunks:
+                        if cid not in db_chunks:
+                            # Not in primary database (deleted or orphan) -> ignore
+                            continue
                         c_rec = db_chunks[cid]
                         content = c_rec.content
                         doc_id_str = str(c_rec.document_id)
@@ -1155,6 +1336,7 @@ async def retrieve_relevant_chunks(
                     else:
                         content = payload.get("content") or payload.get("document", "")
                         fname = payload.get("file_name", POLICY_FILENAME)
+                        doc_id_str = str(payload.get("document_id") or "")
                         sec = payload.get("section")
                         top = payload.get("topic")
                         pg = int(payload.get("page_number", 1))
@@ -1165,7 +1347,7 @@ async def retrieve_relevant_chunks(
                         doc = Document(
                             page_content=content,
                             metadata={
-                                "document_id": payload.get("document_id"),
+                                "document_id": doc_id_str or payload.get("document_id"),
                                 "filename": fname,
                                 "file_name": fname,
                                 "chunk_id": cid,
@@ -1182,16 +1364,83 @@ async def retrieve_relevant_chunks(
         except Exception as e:
             logger.error("Qdrant similarity search encountered an error: %s. Falling back to secondary stores.", e)
 
+    if not scored_chunks and document_id:
+        try:
+            from src.database.connection import AsyncSessionLocal
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(
+                    select(DocumentChunk, DocumentModel.file_name)
+                    .join(DocumentModel, DocumentModel.document_id == DocumentChunk.document_id)
+                    .where(DocumentChunk.document_id == document_id)
+                    .order_by(DocumentChunk.chunk_index)
+                    .limit(k)
+                )
+                for chk_row in res.all():
+                    c_rec, fname = chk_row[0], chk_row[1]
+                    doc = Document(
+                        page_content=c_rec.content,
+                        metadata={
+                            "document_id": str(c_rec.document_id),
+                            "filename": fname,
+                            "file_name": fname,
+                            "chunk_id": c_rec.chunk_id,
+                            "section": c_rec.section,
+                            "topic": c_rec.topic,
+                            "page": c_rec.page_number,
+                            "page_number": c_rec.page_number,
+                            "chunk_index": c_rec.chunk_index,
+                            "content_hash": c_rec.content_hash,
+                            "score": 0.5,
+                        },
+                    )
+                    scored_chunks.append((0.5, doc))
+        except Exception as db_fallback_err:
+            logger.warning("Target document fallback fetch error: %s", db_fallback_err)
+
     if not scored_chunks:
         return []
 
     scored_chunks.sort(key=lambda x: x[0], reverse=True)
+
+    if document_id:
+        # When specifically querying a targeted document, return its top chunks
+        return [doc for score, doc in scored_chunks[:k]]
+
     if not scored_chunks or scored_chunks[0][0] < threshold:
         return []
 
     top_score = scored_chunks[0][0]
     effective_threshold = max(threshold, top_score - 0.12)
-    return [doc for score, doc in scored_chunks[:k] if score >= effective_threshold]
+    filtered = [doc for score, doc in scored_chunks[:k] if score >= effective_threshold]
+
+    # Filter out spurious chunks that have zero lexical relevance when similarity is mediocre (< 0.72)
+    stop_words = {
+        "what", "is", "are", "the", "a", "an", "in", "of", "to", "for", "on", "with",
+        "about", "how", "why", "when", "where", "can", "could", "should", "would",
+        "do", "does", "did", "please", "tell", "me", "give", "show", "i", "you", "we",
+    }
+    q_words = {w for w in re.findall(r"\w+", query.lower()) if len(w) > 2 and w not in stop_words}
+
+    meaningful: list[Document] = []
+    for doc in filtered:
+        d_score = float(doc.metadata.get("score") or 0.0)
+        if d_score >= 0.72:
+            meaningful.append(doc)
+            continue
+        chunk_text = (
+            doc.page_content + " " + (doc.metadata.get("section") or "") + " " + (doc.metadata.get("topic") or "")
+        ).lower()
+        if any(w in chunk_text for w in q_words):
+            meaningful.append(doc)
+        else:
+            logger.info(
+                "Discarded spurious chunk %s (score %.4f) with 0 keyword overlap for query '%s'",
+                doc.metadata.get("chunk_id"),
+                d_score,
+                query,
+            )
+
+    return meaningful
 
 
 
@@ -1333,6 +1582,104 @@ async def generate_rag_answer(
 # 6. MAIN CHAT SERVICE & DATABASE PERSISTENCE
 # ============================================================
 
+async def detect_target_document_from_query(
+    query: str,
+    db: AsyncSession,
+) -> uuid.UUID | None:
+    """
+    Detects if the user query specifically targets a particular document by name or alias.
+    Handles numeric prefixes (e.g. '11.Bubble sort (ascending order).txt'), parentheses,
+    and partial phrases (e.g. 'what bubble sort?').
+    If so, returns that document's UUID to restrict retrieval and citations strictly to that document.
+    """
+    if not query:
+        return None
+
+    q_lower = query.lower()
+
+    try:
+        docs = await get_documents(db)
+        if not docs:
+            return None
+
+        doc_scores: dict[uuid.UUID, int] = {}
+
+        for doc in docs:
+            fname = (doc.file_name or "").lower()
+            is_default = (doc.document_id == POLICY_DOC_ID) or ("workpilot" in fname)
+
+            if is_default:
+                default_aliases = [
+                    "workpilot",
+                    "work pilot",
+                    "company policy",
+                    "company handbook",
+                    "default policy",
+                    "employee handbook",
+                    "workpilot_company_policy",
+                ]
+                for alias in default_aliases:
+                    if alias in q_lower:
+                        doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 80 + len(alias))
+            else:
+                stem = fname.rsplit(".", 1)[0]
+                # Strip leading numbering like '11.', '01_', '1 - '
+                clean_stem = re.sub(r"^[\d\.\-_\s]+", "", stem).strip()
+                # Normalize punctuation and parens to space
+                normalized_stem = re.sub(r"[\(\)\[\]\{\}\-_,\.:;]+", " ", clean_stem).strip()
+                words = [w for w in normalized_stem.split() if len(w) > 1]
+
+                # Generate n-grams (bigrams and trigrams)
+                bigrams = [" ".join(words[i:i+2]) for i in range(len(words)-1)]
+                trigrams = [" ".join(words[i:i+3]) for i in range(len(words)-2)]
+
+                # Check exact and clean file stems
+                if fname in q_lower or (len(stem) >= 3 and stem in q_lower):
+                    doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 120)
+                elif len(clean_stem) >= 3 and clean_stem in q_lower:
+                    doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 110)
+                elif len(normalized_stem) >= 3 and normalized_stem in q_lower:
+                    doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 100)
+
+                # Check trigrams
+                for tri in trigrams:
+                    if tri in q_lower and len(tri) >= 4:
+                        doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 90 + len(tri))
+
+                # Check bigrams (e.g. "bubble sort", "ms leave")
+                for bi in bigrams:
+                    if bi in q_lower and len(bi) >= 4:
+                        doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 80 + len(bi))
+
+                # Check first unique keyword combined with doc/pdf/file/policy/handbook
+                if words and words[0] not in ("company", "policy", "the", "doc", "file"):
+                    first = words[0]
+                    if len(first) >= 3 and first in q_lower:
+                        if any(kw in q_lower for kw in ("policy", "leave", "doc", "pdf", "handbook", "file")):
+                            doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 75)
+                        elif len(words) == 1 or len(first) >= 6:
+                            doc_scores[doc.document_id] = max(doc_scores.get(doc.document_id, 0), 70)
+
+        if not doc_scores:
+            return None
+
+        # Sort by score descending
+        sorted_matches = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+        top_id, top_score = sorted_matches[0]
+
+        # Require a solid score (>= 75) to count as an explicit targeted document
+        if top_score >= 75:
+            if len(sorted_matches) > 1 and sorted_matches[1][1] == top_score:
+                logger.info("Ambiguous document target query '%s'; multiple docs matched with equal score %d", query, top_score)
+                return None
+            return top_id
+
+        return None
+    except Exception as e:
+        logger.warning("Error detecting target document from query: %s", e)
+        return None
+
+
 class ChatService:
     """
     Coordinates chat message persistence, RAG context retrieval,
@@ -1349,8 +1696,27 @@ class ChatService:
         document_id: uuid.UUID | None = None,
         session_id: str | None = None,
     ) -> ChatMessage:
-        """Inserts and commits a new chat message into the database."""
+        """Inserts and commits a new chat message into the database and tracks conversation sessions."""
         try:
+            if session_id:
+                stmt_s = select(ChatSession).where(ChatSession.id == session_id)
+                res_s = await self.session.execute(stmt_s)
+                sess = res_s.scalar_one_or_none()
+                now = datetime.now(timezone.utc)
+                if not sess:
+                    title = content[:80].strip() if role == "user" else "Chat Session"
+                    sess = ChatSession(
+                        id=session_id,
+                        title=title,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    self.session.add(sess)
+                else:
+                    sess.updated_at = now
+                    if (not sess.title or sess.title == "Chat Session") and role == "user":
+                        sess.title = content[:80].strip()
+
             msg = ChatMessage(
                 document_id=document_id or DEFAULT_DOC_ID,
                 session_id=session_id,
@@ -1409,6 +1775,13 @@ class ChatService:
             except Exception:
                 pass
 
+        # If no explicit document_id passed, auto-detect if the query specifically targets a single document
+        if not doc_filter:
+            target_id = await detect_target_document_from_query(request.message, self.session)
+            if target_id:
+                doc_filter = target_id
+                logger.info("Targeted query exclusively to document %s for prompt: '%s'", target_id, request.message)
+
         # 1. Record user message
         try:
             await self.add_message(
@@ -1433,32 +1806,83 @@ class ChatService:
             matching_docs = []
             show_pdf = True
 
+        if doc_filter and matching_docs:
+            matching_docs = [
+                d for d in matching_docs
+                if str(d.metadata.get("document_id", "")) == str(doc_filter)
+            ]
+
+        # Detect if LLM stated the requested topic is not found / not documented
+        is_negative_answer = any(
+            phrase in answer.lower()
+            for phrase in [
+                "not specified in the retrieved knowledge base",
+                "not documented in the current knowledge base",
+                "not found in the available knowledge base",
+                "not mentioned in the retrieved context",
+                "couldn't find information regarding",
+                "not specified in the available documents",
+            ]
+        )
+
         seen_keys: set[str] = set()
         sources: list[SourceChunk] = []
-        for d in matching_docs:
-            fname = d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME)
-            pg = int(d.metadata.get("page") or d.metadata.get("page_number", 1))
-            sec = d.metadata.get("section")
-            top = d.metadata.get("topic")
-            cid = d.metadata.get("chunk_id")
-            c_idx = int(d.metadata.get("chunk_index", 0))
 
-            dedup_key = cid or f"{fname}_{pg}_{sec}_{top}_{c_idx}"
-            if dedup_key not in seen_keys:
-                seen_keys.add(dedup_key)
-                sources.append(
-                    SourceChunk(
-                        filename=fname,
-                        page=pg,
-                        chunk_index=c_idx,
-                        section=sec,
-                        topic=top,
-                        chunk_id=cid,
+        # If it's a negative answer and no specific document was targeted,
+        # do not attach spurious sources from unrelated knowledge base documents
+        if not (is_negative_answer and not doc_filter):
+            for d in matching_docs:
+                fname = d.metadata.get("filename") or d.metadata.get("file_name", POLICY_FILENAME)
+                pg = int(d.metadata.get("page") or d.metadata.get("page_number", 1))
+                sec = d.metadata.get("section")
+                top = d.metadata.get("topic")
+                cid = d.metadata.get("chunk_id")
+                c_idx = int(d.metadata.get("chunk_index", 0))
+                doc_id = str(d.metadata.get("document_id") or "")
+
+                dedup_key = cid or f"{fname}_{pg}_{sec}_{top}_{c_idx}"
+                if dedup_key not in seen_keys:
+                    seen_keys.add(dedup_key)
+                    sources.append(
+                        SourceChunk(
+                            filename=fname,
+                            page=pg,
+                            chunk_index=c_idx,
+                            section=sec,
+                            topic=top,
+                            chunk_id=cid,
+                            document_id=doc_id if doc_id else None,
+                        )
                     )
-                )
 
-        if show_pdf and not sources:
-            sources.append(SourceChunk(filename=POLICY_FILENAME, page=1, chunk_index=0))
+        if doc_filter and not sources:
+            target_fname = "Document"
+            try:
+                res_doc = await self.session.execute(
+                    select(DocumentModel.file_name).where(DocumentModel.document_id == doc_filter)
+                )
+                fn_val = res_doc.scalar_one_or_none()
+                if fn_val:
+                    target_fname = fn_val
+            except Exception:
+                pass
+            sources.append(
+                SourceChunk(
+                    filename=target_fname,
+                    page=1,
+                    chunk_index=0,
+                    document_id=str(doc_filter),
+                )
+            )
+        elif show_pdf and not sources and not is_negative_answer:
+            sources.append(
+                SourceChunk(
+                    filename=POLICY_FILENAME,
+                    page=1,
+                    chunk_index=0,
+                    document_id=str(POLICY_DOC_ID),
+                )
+            )
 
         # 3. Record assistant answer
         try:
@@ -1645,22 +2069,72 @@ def generate_company_policy_pdf(target_path: Path | str | None = None) -> Path:
     doc = SimpleDocTemplate(str(target_path), pagesize=letter, rightMargin=45, leftMargin=45, topMargin=40, bottomMargin=40)
     styles = getSampleStyleSheet()
 
-    doc_header_style = ParagraphStyle("DocHeader", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=15, leading=19, textColor=colors.HexColor("#0F172A"), spaceAfter=2)
-    doc_sub_style = ParagraphStyle("DocSub", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=8.5, leading=11, textColor=colors.HexColor("#2563EB"), spaceAfter=6)
-    sec_title_style = ParagraphStyle("SecTitle", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11.5, leading=15, textColor=colors.HexColor("#1E293B"), spaceBefore=8, spaceAfter=4)
-    intro_style = ParagraphStyle("IntroStyle", parent=styles["Normal"], fontName="Helvetica-Oblique", fontSize=9, leading=12.5, textColor=colors.HexColor("#334155"), spaceAfter=5)
-    bullet_style = ParagraphStyle("BulletStyle", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=12, textColor=colors.HexColor("#1E293B"), leftIndent=14, spaceAfter=4)
-    page_footer_style = ParagraphStyle("PageFooter", parent=styles["Normal"], fontName="Helvetica", fontSize=8, leading=10, textColor=colors.HexColor("#94A3B8"), alignment=1)
+    doc_header_style = ParagraphStyle(
+        "DocHeader",
+        parent=styles["Heading1"],
+        fontName="Helvetica-Bold",
+        fontSize=15,
+        leading=19,
+        textColor=colors.HexColor("#0F172A"),
+        spaceAfter=2,
+    )
+    doc_sub_style = ParagraphStyle(
+        "DocSub",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#4F46E5"),
+        spaceAfter=6,
+    )
+    sec_title_style = ParagraphStyle(
+        "SecTitle",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor("#1E293B"),
+        spaceBefore=10,
+        spaceAfter=4,
+    )
+    intro_style = ParagraphStyle(
+        "IntroStyle",
+        parent=styles["Normal"],
+        fontName="Helvetica-Oblique",
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#475569"),
+        spaceAfter=6,
+    )
+    bullet_style = ParagraphStyle(
+        "BulletStyle",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=12.5,
+        textColor=colors.HexColor("#1E293B"),
+        leftIndent=14,
+        spaceAfter=4,
+    )
+    page_footer_style = ParagraphStyle(
+        "PageFooter",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#64748B"),
+        alignment=1,
+    )
 
     story = []
     for page_idx, page_data in enumerate(POLICY_PAGES):
         page_num = page_data["page"]
         story.append(Paragraph("WORKPILOT ENTERPRISE COMPANY POLICY & EMPLOYEE HANDBOOK", doc_header_style))
         story.append(Paragraph("Official Human Resources & Operations Guidelines | Confidential & Proprietary", doc_sub_style))
-        story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E1"), spaceAfter=10))
+        story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#4F46E5"), spaceAfter=10))
 
         for sec in page_data["sections"]:
-            story.append(Paragraph(f"## {sec['num']}. {sec['title']}", sec_title_style))
+            story.append(Paragraph(f"§ {sec['num']}. {sec['title']}", sec_title_style))
             if sec.get("intro"):
                 story.append(Paragraph(sec["intro"], intro_style))
 
@@ -1674,8 +2148,8 @@ def generate_company_policy_pdf(target_path: Path | str | None = None) -> Path:
             story.append(Spacer(1, 6))
 
         story.append(Spacer(1, 14))
-        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#E2E8F0"), spaceAfter=6))
-        story.append(Paragraph(f"Page {page_num} of 5 — WorkPilot Policy Documentation", page_footer_style))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CBD5E1"), spaceAfter=6))
+        story.append(Paragraph(f"Page {page_num} of 5 — WorkPilot Official Policy Handbook", page_footer_style))
 
         if page_idx < len(POLICY_PAGES) - 1:
             story.append(PageBreak())
