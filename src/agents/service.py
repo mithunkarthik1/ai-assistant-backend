@@ -112,7 +112,7 @@ class AgentLLM:
             f"User request: {request}"
         )
         answer = await self._invoke(
-            "You are WorkPilot, an intelligent workplace AI assistant that helps users with their projects, tasks, and documents.",
+            "You are AI Assistant , an intelligent workplace AI assistant that helps users with their projects, tasks, and documents.",
             prompt,
             temperature=0.6,
         )

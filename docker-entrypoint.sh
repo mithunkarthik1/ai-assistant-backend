@@ -11,7 +11,7 @@ fi
 
 # Execute CMD arguments or default to uvicorn
 if [ $# -eq 0 ]; then
-    echo "==> Starting WorkPilot AI Assistant backend..."
+    echo "==> Starting AI Assistant backend..."
     exec uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
 else
     echo "==> Starting service with command: $*"

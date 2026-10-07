@@ -1,6 +1,6 @@
-# WorkPilot AI Assistant Backend
+#  AI Assistant Backend
 
-FastAPI backend for the WorkPilot assistant. The application combines the existing policy RAG workflow with a separate Agentic AI workflow for project-related requests.
+FastAPI backend for the AI assistant. The application combines the existing policy RAG workflow with a separate Agentic AI workflow for project-related requests.
 
 ## Architecture
 
