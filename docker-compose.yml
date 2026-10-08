@@ -12,11 +12,11 @@ services:
       - "9000:9000"
     volumes:
       - ./src:/app/src
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/projects/PROJ-123"]
-      interval: 3s
-      timeout: 3s
-      retries: 5
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/projects/PROJ-123"]
+    #   interval: 3s
+    #   timeout: 3s
+    #   retries: 5
 
   backend:
     build:
@@ -28,9 +28,9 @@ services:
       - "8001:8001"
     env_file:
       - .env
-    depends_on:
-      project-api:
-        condition: service_healthy
+    # depends_on:
+    #   project-api:
+    #     condition: service_healthy
     volumes:
       - ./data:/app/data
       - ./src:/app/src

@@ -23,8 +23,10 @@ RUN poetry config virtualenvs.create false \
 # Copy application source code
 COPY . .
 
-# Ensure entrypoint script is executable
-RUN chmod +x /app/docker-entrypoint.sh
+# Normalize Windows line endings, then ensure the entrypoint is executable.
+# Without this, `/bin/sh` in a CRLF shebang is interpreted as `/bin/sh\r` on Linux.
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8001
 

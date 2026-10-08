@@ -104,6 +104,29 @@ class AppSettings(BaseSettings):
         validation_alias=AliasChoices("AGENT_MEMORY_MAX_MESSAGES", "MEMORY_MAX_MESSAGES"),
     )
 
+    jwt_secret_key: str = Field(
+        default="your-secret-key",
+        validation_alias=AliasChoices("JWT_SECRET_KEY"),
+    )
+
+    jwt_algorithm: str = Field(
+        default="HS256",
+        validation_alias=AliasChoices("JWT_ALGORITHM"),
+    )
+
+    jwt_access_token_expire_minutes: int = Field(
+        
+        default=15,
+        validation_alias=AliasChoices("JWT_ACCESS_TOKEN_EXPIRE_MINUTES"),
+    )
+
+    jwt_refresh_token_expire_days: int = Field(
+        default=7,
+        validation_alias=AliasChoices("JWT_REFRESH_TOKEN_EXPIRE_DAYS"),
+    )
+
+    
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -113,6 +136,12 @@ class AppSettings(BaseSettings):
 
 
 settings = AppSettings()
+
+
+def get_settings() -> AppSettings:
+    """Return the shared application settings instance."""
+    return settings
+
 
 # Feature modules can use this descriptive alias while all values still come
 # from the single shared settings object above.
