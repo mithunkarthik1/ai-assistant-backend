@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.connection import get_db
+from src.auth.dependancy import get_current_user, get_optional_current_user, require_auth
 from src.rag.model import ChatSession
 from src.rag.schema import (
     ChatMessageResponse,
@@ -50,15 +51,22 @@ rag_router = APIRouter(prefix="/rag", tags=["rag"])
     response_model=ChatResponse,
     include_in_schema=False,
 )
+@require_auth()
 async def chat_with_policy(
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> ChatResponse:
     """
     Submits a user question to the RAG pipeline and returns the grounded LLM answer
     along with source document citations.
     """
-    logger.info("Incoming chat request: '%s' (session_id=%s)", request.message, request.session_id)
+    logger.info(
+        "Incoming chat request from user %s: '%s' (session_id=%s)",
+        current_user.get("sub"),
+        request.message,
+        request.session_id,
+    )
     try:
         service = ChatService(db)
         response = await service.chat(request)
@@ -82,14 +90,16 @@ async def chat_with_policy(
     status_code=status.HTTP_200_OK,
     summary="Execute RAG query with Qdrant vector retrieval and LLM generation",
 )
+@require_auth()
 async def query_rag_endpoint(
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> ChatResponse:
     """
     Submits user question to RAG pipeline via Qdrant similarity search and LLM synthesis.
     """
-    return await chat_with_policy(request, db)
+    return await chat_with_policy(request, db, current_user)
 
 
 @router.get(
@@ -103,10 +113,12 @@ async def query_rag_endpoint(
     summary="Get recent conversation history (legacy compatibility)",
     include_in_schema=False,
 )
+@require_auth()
 async def get_chat_history(
     document_id: str | None = None,
     session_id: str | None = None,
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> list[ChatMessageResponse]:
     """
     Retrieves chronological message history for the active conversation.
@@ -120,7 +132,7 @@ async def get_chat_history(
             except Exception:
                 pass
         history = await service.get_history(document_id=doc_uuid, session_id=session_id)
-        logger.debug("Retrieved %d history items", len(history))
+        logger.debug("Retrieved %d history items for user %s", len(history), current_user.get("sub"))
         return history
     except Exception as e:
         logger.error("Failed to fetch chat history: %s", e, exc_info=True)
@@ -134,8 +146,10 @@ async def get_chat_history(
     "/sessions",
     summary="Get all conversation sessions",
 )
+@require_auth()
 async def get_chat_sessions(
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     """
     Retrieves all chat sessions ordered by most recently updated.
@@ -165,7 +179,9 @@ async def get_chat_sessions(
     "/pdf",
     summary="Download or view the official WorkPilot Company Policy Handbook (PDF)",
 )
-async def get_policy_pdf() -> FileResponse:
+async def get_policy_pdf(
+    current_user: dict[str, Any] | None = Depends(get_optional_current_user),
+) -> FileResponse:
     """
     Serves the official company policy PDF document for inline browser viewing.
     """
@@ -208,7 +224,10 @@ async def get_policy_pdf() -> FileResponse:
     "/policy-pages",
     summary="Get structured company policy pages for interactive viewer and search",
 )
-async def get_policy_pages() -> dict[str, Any]:
+@require_auth()
+async def get_policy_pages(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     """
     Returns structured page-by-page JSON policy data for client-side handbook viewer.
     """
@@ -232,16 +251,23 @@ async def get_policy_pages() -> dict[str, Any]:
     summary="Upload PDF, DOCX, or TXT for incremental RAG indexing (chat alias)",
     include_in_schema=False,
 )
+@require_auth()
 async def upload_document(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> DocumentUploadResponse:
     """
     Uploads a document (PDF, DOCX, TXT), performs structure-aware hybrid chunking,
     computes deterministic chunk hashes, and incrementally embeds/indexes only modified chunks.
     """
     filename = file.filename or "uploaded_document.pdf"
-    logger.info("Received document upload request: '%s' (content_type=%s)", filename, file.content_type)
+    logger.info(
+        "Received document upload request from user %s: '%s' (content_type=%s)",
+        current_user.get("sub"),
+        filename,
+        file.content_type,
+    )
 
     try:
         file_bytes = await file.read()
@@ -283,8 +309,10 @@ async def upload_document(
     response_model=list[DocumentInfoResponse],
     summary="List all registered knowledge base documents",
 )
+@require_auth()
 async def list_documents(
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> list[DocumentInfoResponse]:
     """
     Returns list of all documents registered in the system along with their current status and chunk counts.
@@ -318,9 +346,11 @@ async def list_documents(
     response_model=DocumentDetailResponse,
     summary="Get document details and indexed chunk structure",
 )
+@require_auth()
 async def get_document(
     document_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> DocumentDetailResponse:
     """
     Retrieves full details for a document including its hybrid chunk hierarchy and content hashes.
@@ -373,9 +403,11 @@ async def get_document(
     "/{document_id}/pages",
     summary="Get structured pages and contents of a document for handbook viewer",
 )
+@require_auth()
 async def get_document_pages_endpoint(
     document_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """
     Returns structured page data for any document (default policy or uploaded document)
@@ -408,16 +440,18 @@ async def get_document_pages_endpoint(
 
     # Group chunks by page_number
     page_map: dict[int, list[dict[str, Any]]] = {}
+    is_markdown = (doc.file_type or "").lower() in ("md", "markdown") or doc.file_name.lower().endswith((".md", ".markdown"))
     for c in chunks:
         pg = c.page_number or 1
         if pg not in page_map:
             page_map[pg] = []
-        normalized_content = normalize_extracted_pdf_text(c.content) if c.content else ""
+        is_plain_pdf = (doc.file_type or "").lower() == "pdf" and "```" not in (c.content or "")
+        normalized_content = normalize_extracted_pdf_text(c.content) if is_plain_pdf and c.content else (c.content or "")
         page_map[pg].append({
             "chunk_id": c.chunk_id,
             "section": c.section or "Section",
             "topic": c.topic or "General",
-            "content": normalized_content or c.content,
+            "content": normalized_content,
         })
 
     structured_pages = []
@@ -445,6 +479,7 @@ async def get_document_pages_endpoint(
     return {
         "document_id": str(doc.document_id),
         "file_name": doc.file_name,
+        "file_type": doc.file_type or ("md" if is_markdown else "txt"),
         "is_default": False,
         "pages": structured_pages,
     }
@@ -454,9 +489,11 @@ async def get_document_pages_endpoint(
     "/{document_id}",
     summary="Delete a document and purge its vectors from index",
 )
+@require_auth()
 async def delete_doc(
     document_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     """
     Deletes a document from registry and purges all corresponding vectors from vector store.

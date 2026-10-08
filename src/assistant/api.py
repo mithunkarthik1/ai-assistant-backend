@@ -2,6 +2,7 @@
 
 import logging
 from functools import lru_cache
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +12,7 @@ from src.assistant.schema import AssistantRequest, AssistantResponse
 from src.assistant.service import UnifiedAssistantService
 from src.core.config import settings as agent_settings
 from src.database.connection import get_db
+from src.auth.dependancy import get_current_user
 
 logger = logging.getLogger("src.assistant.api")
 router = APIRouter(prefix="/assistant", tags=["assistant"])
@@ -32,6 +34,7 @@ async def assistant_chat(
     request: AssistantRequest,
     db: AsyncSession = Depends(get_db),
     service: UnifiedAssistantService = Depends(get_assistant_service),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AssistantResponse:
     try:
         return await service.chat(request, db)

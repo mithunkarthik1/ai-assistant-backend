@@ -34,6 +34,7 @@ AsyncSessionLocal = async_sessionmaker(
 async def init_db() -> None:
     """Initialize relational application tables in the database."""
     from src.rag.model import ChatMessage, ChatSession, Document, DocumentChunk  # noqa: F401
+    from src.auth.model import User, RefreshToken, AccessTokenBlacklist  # noqa: F401
 
     try:
         async with engine.begin() as conn:

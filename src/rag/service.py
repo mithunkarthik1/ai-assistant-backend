@@ -126,7 +126,7 @@ def normalize_extracted_pdf_text(text: str) -> str:
         if not b_clean:
             continue
         b_clean = re.sub(r"^[●○■◆►]\s*", "• ", b_clean)
-        b_clean = re.sub(r"\s+\d+$", "", b_clean)
+        b_clean = re.sub(r"\s+Page\s+\d+$", "", b_clean, flags=re.I)
         final_blocks.append(b_clean)
 
     return "\n\n".join(final_blocks)
@@ -134,16 +134,100 @@ def normalize_extracted_pdf_text(text: str) -> str:
 
 def extract_text_from_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
     """
-    Extracts text page-by-page from PDF bytes using pypdf.
-    Returns list of dicts: [{"page_number": 1, "text": "..."}, ...]
+    Extracts text page-by-page from PDF bytes using PyMuPDF (pymupdf), pypdf,
+    and pytesseract Optical Character Recognition (OCR).
+
+    When a PDF page contains embedded images (diagrams, flowcharts, tables, infographics)
+    or is a pure scanned image (zero or minimal digital text), this function:
+    1. Extracts embedded raster images on the page and OCR-transcribes their text.
+    2. If the page lacks digital text (< 40 characters), renders the page at 200 DPI
+       and executes full-page OCR to extract all scanned contents.
+    3. Merges the digital text and OCR-extracted text before semantic chunking and embedding.
     """
+    # 1. Check pytesseract & PIL availability
+    has_ocr = False
+    try:
+        import pytesseract
+        from PIL import Image
+        has_ocr = True
+    except ImportError:
+        logger.warning("pytesseract or PIL is not installed; image OCR will be skipped.")
+
+    # 2. Try primary engine: PyMuPDF (pymupdf) for deep image and scan extraction
+    try:
+        import pymupdf
+        doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+        pages_data: list[dict[str, Any]] = []
+
+        for idx, page in enumerate(doc):
+            native_text = (page.get_text() or "").strip()
+            ocr_blocks: list[str] = []
+
+            if has_ocr:
+                # A. Extract embedded images on this page (diagrams, flowcharts, tables)
+                try:
+                    image_list = page.get_images(full=True)
+                    for img_info in image_list:
+                        try:
+                            xref = img_info[0]
+                            base_img = doc.extract_image(xref)
+                            img_data = base_img.get("image")
+                            if img_data:
+                                img = Image.open(io.BytesIO(img_data))
+                                # Skip tiny decorative icons / bullet dots (< 30x30 px)
+                                if img.width >= 30 and img.height >= 30:
+                                    if img.mode not in ("RGB", "L"):
+                                        img = img.convert("RGB")
+                                    ocr_text = pytesseract.image_to_string(img).strip()
+                                    if ocr_text and len(ocr_text) >= 3:
+                                        ocr_blocks.append(f"[Image / Diagram Content]:\n{ocr_text}")
+                        except Exception as img_err:
+                            logger.debug("Failed to OCR embedded image on page %d: %s", idx + 1, img_err)
+                except Exception as get_img_err:
+                    logger.debug("Failed to get images from page %d: %s", idx + 1, get_img_err)
+
+                # B. Scanned Page Fallback: If page has minimal digital text (< 40 chars)
+                # render the entire page to a high-resolution pixmap (200 DPI) and run full-page OCR
+                if len(native_text) < 40 and not ocr_blocks:
+                    try:
+                        pix = page.get_pixmap(dpi=200)
+                        rendered_img = Image.open(io.BytesIO(pix.tobytes("png")))
+                        page_ocr_text = pytesseract.image_to_string(rendered_img).strip()
+                        if page_ocr_text and len(page_ocr_text) >= 3:
+                            logger.info("Page %d: Scanned image page detected; extracted %d chars via full-page OCR.", idx + 1, len(page_ocr_text))
+                            ocr_blocks.append(page_ocr_text)
+                    except Exception as scan_err:
+                        logger.debug("Failed to perform full-page scan OCR on page %d: %s", idx + 1, scan_err)
+
+            # Combine native digital text and image OCR text
+            if ocr_blocks:
+                logger.info("Page %d: Successfully extracted %d OCR block(s) from embedded PDF images.", idx + 1, len(ocr_blocks))
+                combined_ocr = "\n\n".join(ocr_blocks)
+                if native_text:
+                    full_page_content = f"{native_text}\n\n{combined_ocr}"
+                else:
+                    full_page_content = combined_ocr
+            else:
+                full_page_content = native_text
+
+            clean_text = normalize_extracted_pdf_text(full_page_content)
+            pages_data.append({
+                "page_number": idx + 1,
+                "text": clean_text if clean_text else full_page_content,
+            })
+
+        total_extracted = sum(len(p["text"].strip()) for p in pages_data)
+        if total_extracted > 0:
+            return pages_data
+        logger.warning("PyMuPDF extracted 0 text characters; attempting pypdf fallback.")
+    except ImportError:
+        logger.debug("pymupdf not installed; falling back to pypdf.")
+    except Exception as mupdf_err:
+        logger.warning("PyMuPDF extraction failed: %s; falling back to pypdf.", mupdf_err)
+
+    # 3. Secondary engine: pypdf fallback
     try:
         import pypdf
-    except ImportError as e:
-        logger.error("pypdf is required for PDF extraction: %s", e)
-        raise ExtractionError("pypdf library is not installed.") from e
-
-    try:
         reader = pypdf.PdfReader(io.BytesIO(file_bytes))
         if reader.is_encrypted:
             try:
@@ -151,18 +235,38 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
             except Exception as e:
                 raise ExtractionError("Encrypted PDF could not be decrypted.") from e
 
-        pages_data: list[dict[str, Any]] = []
+        pages_data = []
         for idx, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            clean_text = normalize_extracted_pdf_text(page_text)
+            page_text = (page.extract_text() or "").strip()
+            ocr_blocks = []
+            if has_ocr and hasattr(page, "images"):
+                try:
+                    for img_obj in page.images:
+                        try:
+                            img = Image.open(io.BytesIO(img_obj.data))
+                            if img.width >= 30 and img.height >= 30:
+                                if img.mode not in ("RGB", "L"):
+                                    img = img.convert("RGB")
+                                ocr_text = pytesseract.image_to_string(img).strip()
+                                if ocr_text and len(ocr_text) >= 3:
+                                    ocr_blocks.append(f"[Image / Diagram Content]:\n{ocr_text}")
+                        except Exception as img_err:
+                            logger.debug("Failed to OCR image on page %d: %s", idx + 1, img_err)
+                except Exception as page_img_err:
+                    logger.debug("Failed to extract images from page %d: %s", idx + 1, page_img_err)
+
+            if ocr_blocks:
+                logger.info("Page %d: Successfully extracted %d OCR block(s) from embedded PDF images.", idx + 1, len(ocr_blocks))
+                combined_ocr = "\n\n".join(ocr_blocks)
+                full_page_content = f"{page_text}\n\n{combined_ocr}" if page_text else combined_ocr
+            else:
+                full_page_content = page_text
+
+            clean_text = normalize_extracted_pdf_text(full_page_content)
             pages_data.append({
                 "page_number": idx + 1,
-                "text": clean_text if clean_text else page_text,
+                "text": clean_text if clean_text else full_page_content,
             })
-
-        total_extracted = sum(len(p["text"].strip()) for p in pages_data)
-        if total_extracted == 0:
-            logger.warning("PDF extracted 0 text characters across %d pages (may be scanned images).", len(pages_data))
 
         return pages_data
     except Exception as e:
@@ -214,9 +318,60 @@ def extract_text_from_docx(file_bytes: bytes) -> list[dict[str, Any]]:
         raise ExtractionError(f"Failed to extract text from DOCX: {str(e)}") from e
 
 
+def extract_text_from_markdown(file_bytes: bytes) -> list[dict[str, Any]]:
+    """
+    Decodes markdown bytes and segments into logical pages based on horizontal
+    rules (---, ***), major headings (#, ##), or logical size thresholds.
+    """
+    try:
+        text_content = file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text_content = file_bytes.decode("latin-1")
+        except Exception as e:
+            raise ExtractionError(f"Failed to decode markdown file: {str(e)}") from e
+
+    text = text_content.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return [{"page_number": 1, "text": ""}]
+
+    # 1. Check for explicit horizontal rules/page breaks (e.g. \n---\n or \n***\n)
+    rule_parts = [p.strip() for p in re.split(r"\n\s*(?:---|___|\*\*\*)\s*\n", text) if p.strip()]
+    if len(rule_parts) > 1:
+        return [{"page_number": idx + 1, "text": part} for idx, part in enumerate(rule_parts)]
+
+    # 2. Check for major headings (# or ##) if document is substantial
+    if len(text) > 1500:
+        lines = text.split("\n")
+        pages: list[str] = []
+        current_page_lines: list[str] = []
+        current_page_chars = 0
+
+        for line in lines:
+            stripped = line.strip()
+            # New major section (# or ##) after at least 1000 characters triggers new page
+            is_major_heading = bool(re.match(r"^#{1,2}\s+[A-Za-z0-9]", stripped))
+            if is_major_heading and current_page_chars >= 1000 and current_page_lines:
+                pages.append("\n".join(current_page_lines).strip())
+                current_page_lines = []
+                current_page_chars = 0
+
+            current_page_lines.append(line)
+            current_page_chars += len(line) + 1
+
+        if current_page_lines:
+            pages.append("\n".join(current_page_lines).strip())
+
+        if len(pages) > 1:
+            return [{"page_number": idx + 1, "text": page_str} for idx, page_str in enumerate(pages)]
+
+    # Default to single page if short or no clear section breaks
+    return [{"page_number": 1, "text": text.strip()}]
+
+
 def extract_text_from_txt(file_bytes: bytes) -> list[dict[str, Any]]:
     """
-    Decodes plain text or markdown file bytes.
+    Decodes plain text file bytes.
     """
     try:
         text_content = file_bytes.decode("utf-8")
@@ -225,6 +380,25 @@ def extract_text_from_txt(file_bytes: bytes) -> list[dict[str, Any]]:
             text_content = file_bytes.decode("latin-1")
         except Exception as e:
             raise ExtractionError(f"Failed to decode text file: {str(e)}") from e
+
+    # For long plain text files, split into logical pages every ~2500 chars on double newlines
+    text = text_content.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > 3000:
+        paras = text.split("\n\n")
+        pages: list[str] = []
+        cur_lines: list[str] = []
+        cur_len = 0
+        for p in paras:
+            cur_lines.append(p)
+            cur_len += len(p)
+            if cur_len >= 2200:
+                pages.append("\n\n".join(cur_lines).strip())
+                cur_lines = []
+                cur_len = 0
+        if cur_lines:
+            pages.append("\n\n".join(cur_lines).strip())
+        if len(pages) > 1:
+            return [{"page_number": idx + 1, "text": pg} for idx, pg in enumerate(pages)]
 
     return [{"page_number": 1, "text": text_content}]
 
@@ -242,7 +416,9 @@ def extract_document_pages(file_bytes: bytes, file_name: str) -> list[dict[str, 
         return extract_text_from_pdf(file_bytes)
     elif ext in ("docx", "doc"):
         return extract_text_from_docx(file_bytes)
-    elif ext in ("txt", "md", "markdown", "rst"):
+    elif ext in ("md", "markdown"):
+        return extract_text_from_markdown(file_bytes)
+    elif ext in ("txt", "rst"):
         return extract_text_from_txt(file_bytes)
     else:
         raise ExtractionError(f"Unsupported file format '.{ext}'. Supported formats: .pdf, .docx, .txt, .md")
@@ -368,7 +544,7 @@ def is_valid_topic_name(title: str | None) -> bool:
     return True
 
 
-def is_heading(line: str) -> tuple[bool, int, str]:
+def is_heading(line: str, is_markdown: bool = False) -> tuple[bool, int, str]:
     """
     Detects if a text line is a section or topic heading.
     Returns (is_heading, heading_level, heading_title).
@@ -377,45 +553,53 @@ def is_heading(line: str) -> tuple[bool, int, str]:
     if not stripped or len(stripped) > 120:
         return False, 0, ""
 
-    # 1. Markdown headings (#, ##, ###, ####)
-    md_match = re.match(r"^(#{1,4})\s+(.+)$", stripped)
+    # 1. Markdown headings (# through ######)
+    md_match = re.match(r"^(#{1,6})\s+(.+)$", stripped)
     if md_match:
         level = len(md_match.group(1))
         title = md_match.group(2).strip()
-        if is_valid_topic_name(title):
-            return True, level, title
+        clean_title = re.sub(r"[\*\_`]", "", title).strip()
+        if len(clean_title) >= 2 and not clean_title.isdigit():
+            return True, level, clean_title
 
-    # 2. Numbered headings (e.g. '1. Working Hours', '§ 5. Health Insurance', 'Section 2: Remote Work', 'Article 3 - Leave')
-    numbered_match = re.match(
-        r"^(?:§\s*|Section\s+|Article\s+)?(\d+(?:\.\d+)*)[:.\-\s]+\s*([A-Za-z].+)$",
-        stripped,
-        re.IGNORECASE,
-    )
-    if numbered_match:
-        title = numbered_match.group(2).strip().rstrip(":")
-        if is_valid_topic_name(title):
-            num_parts = numbered_match.group(1).split(".")
-            level = min(len(num_parts), 4)
-            return True, level, f"{numbered_match.group(1)}. {title}"
+    # For markdown documents, only explicit Markdown headings (#) are section headings!
+    # Lines like "1. Do this" or "Use for:" in markdown are list items or text, NOT section headings!
+    if is_markdown:
+        return False, 0, ""
 
-    # 3. Standalone UPPERCASE heading (at least 8 chars, not ending in period)
-    if stripped.isupper() and len(stripped) >= 8 and not stripped.endswith((".", ";")):
+    # 2. Numbered headings (e.g. '1. Working Hours', '§ 5. Health Insurance', 'Section 2: Remote Work')
+    # Headings do NOT end with sentence-ending periods, and have <= 8 words
+    if not stripped.endswith((".", ";", ":")):
+        numbered_match = re.match(
+            r"^(?:§\s*|Section\s+|Article\s+)?(\d+(?:\.\d+)*)[:.\-\s]+\s*([A-Za-z].+)$",
+            stripped,
+            re.IGNORECASE,
+        )
+        if numbered_match:
+            title = numbered_match.group(2).strip().rstrip(":")
+            if is_valid_topic_name(title) and len(title.split()) <= 8:
+                num_parts = numbered_match.group(1).split(".")
+                level = min(len(num_parts), 4)
+                return True, level, f"{numbered_match.group(1)}. {title}"
+
+    # 3. Standalone UPPERCASE heading (at least 8 chars, not ending in period/colon)
+    if stripped.isupper() and len(stripped) >= 8 and not stripped.endswith((".", ";", ":")):
         title = stripped.rstrip(":").title()
-        if is_valid_topic_name(title):
+        if is_valid_topic_name(title) and len(title.split()) <= 8:
             return True, 1, title
 
     # 4. Heading ending with colon without terminal period and reasonable length
-    if stripped.endswith(":") and len(stripped.split()) <= 8 and not any(p in stripped for p in [".", "?", "!"]):
+    if stripped.endswith(":") and 2 <= len(stripped.split()) <= 6 and not any(p in stripped for p in [".", "?", "!"]):
         raw_title = stripped.rstrip(":").strip()
-        if is_valid_topic_name(raw_title) and (raw_title[0].isupper() or raw_title[0].isdigit()):
-            # Substantial headings (<= 5 words) get level 1, longer get level 2
-            return True, 1 if len(raw_title.split()) <= 5 else 2, raw_title
+        raw_lower = raw_title.lower()
+        if raw_lower not in ("use for", "example", "examples", "note", "notes", "scenario", "response", "request") and is_valid_topic_name(raw_title):
+            return True, 1 if len(raw_title.split()) <= 4 else 2, raw_title
 
-    # 5. Standalone Title Case line without terminal punctuation (e.g. 'Flight Booking Policy', 'Hotel Reimbursement Limits')
+    # 5. Standalone Title Case line without terminal punctuation
     words = stripped.split()
     if (
         2 <= len(words) <= 6
-        and not stripped.endswith((".", ";", ",", "?", "!"))
+        and not stripped.endswith((".", ";", ",", "?", "!", ":", "(", ")"))
         and all(w[0].isupper() or w.lower() in ("and", "or", "of", "in", "to", "for", "the", "a", "an", "&") for w in words if w)
         and is_valid_topic_name(stripped)
     ):
@@ -498,6 +682,7 @@ def hybrid_chunk_pages(
     """
     short_doc_id = str(document_id).split("-")[0]
     hybrid_chunks: list[HybridChunk] = []
+    is_markdown = file_name.lower().endswith((".md", ".markdown"))
 
     semantic_splitter = RecursiveCharacterTextSplitter(
         chunk_size=target_chunk_size,
@@ -511,6 +696,7 @@ def hybrid_chunk_pages(
     global_chunk_idx = 0
 
     topic_chunk_counters: dict[str, int] = {}
+    in_code_block = False
 
     for page_info in pages_data:
         page_num = page_info.get("page_number", 1)
@@ -525,7 +711,7 @@ def hybrid_chunk_pages(
             nonlocal global_chunk_idx
             block_text = "\n".join(current_block).strip()
             current_block.clear()
-            if not block_text:
+            if not block_text or block_text in ("---", "***", "___"):
                 return
 
             # Refine topic and ensure clean semantic hierarchy
@@ -572,7 +758,7 @@ def hybrid_chunk_pages(
                 sub_texts = semantic_splitter.split_text(block_text)
                 for sub_t in sub_texts:
                     sub_t_clean = sub_t.strip()
-                    if not sub_t_clean:
+                    if not sub_t_clean or sub_t_clean in ("---", "***", "___"):
                         continue
 
                     # Further refine topic for sub-chunk if it focuses on a specific sub-clause
@@ -619,12 +805,35 @@ def hybrid_chunk_pages(
                     current_block.append("")
                 continue
 
-            is_head, level, title = is_heading(trimmed)
+            # Code fence toggle: preserve code blocks intact without splitting
+            if trimmed.startswith(("```", "~~~")):
+                in_code_block = not in_code_block
+                current_block.append(trimmed)
+                continue
+
+            if in_code_block:
+                current_block.append(trimmed)
+                continue
+
+            # Markdown table rows: preserve intact
+            if trimmed.startswith("|") and trimmed.endswith("|"):
+                current_block.append(trimmed)
+                continue
+
+            # Horizontal rules: trigger block flush without creating an empty '---' chunk
+            if re.match(r"^(?:---|___|\*\*\*)\s*$", trimmed):
+                if current_block:
+                    flush_block(current_section, current_topic, page_num)
+                continue
+
+            is_head, level, title = is_heading(trimmed, is_markdown=is_markdown)
             if is_head and is_valid_topic_name(title):
-                flush_block(current_section, current_topic, page_num)
+                # Only flush if the previous block actually has content
+                if current_block and sum(len(l) for l in current_block) > 40:
+                    flush_block(current_section, current_topic, page_num)
 
                 # Major heading updates both section & topic; sub-heading updates topic
-                if level == 1 or current_section in ("Overview", "Document"):
+                if level <= 2 or current_section in ("Overview", "Document", "General"):
                     current_section = title
                     current_topic = title
                 else:
@@ -632,12 +841,13 @@ def hybrid_chunk_pages(
 
                 current_block.append(trimmed)
             else:
-                bullet_clause = re.match(r"^[-*•\d.]+\s*(?:\*\*(.+?)\*\*|([A-Za-z0-9\s/&]+):)\s*(.+)$", trimmed)
-                if bullet_clause and len(current_block) > 4:
-                    item_topic = (bullet_clause.group(1) or bullet_clause.group(2) or "").strip()
-                    if is_valid_topic_name(item_topic) and len(item_topic.split()) <= 4:
-                        flush_block(current_section, current_topic, page_num)
-                        current_topic = item_topic
+                if not is_markdown:
+                    bullet_clause = re.match(r"^[-*•\d.]+\s*(?:\*\*(.+?)\*\*|([A-Za-z0-9\s/&]+):)\s*(.+)$", trimmed)
+                    if bullet_clause and len(current_block) > 4:
+                        item_topic = (bullet_clause.group(1) or bullet_clause.group(2) or "").strip()
+                        if is_valid_topic_name(item_topic) and len(item_topic.split()) <= 4:
+                            flush_block(current_section, current_topic, page_num)
+                            current_topic = item_topic
 
                 current_block.append(trimmed)
 

@@ -136,24 +136,32 @@ class QdrantService:
             )
             try:
                 from qdrant_client.models import PayloadSchemaType
-                client.create_payload_index(
-                    collection_name=col_name,
-                    field_name="document_id",
-                    field_schema=PayloadSchemaType.KEYWORD,
-                )
+                for field in ["document_id", "file_name", "filename"]:
+                    try:
+                        client.create_payload_index(
+                            collection_name=col_name,
+                            field_name=field,
+                            field_schema=PayloadSchemaType.KEYWORD,
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
-                logger.warning("Payload index creation on document_id skipped: %s", e)
+                logger.warning("Payload index creation skipped: %s", e)
             logger.info("Qdrant collection '%s' created successfully.", col_name)
             return True
         except UnexpectedResponse as e:
             if "already exists" in str(e).lower():
                 try:
                     from qdrant_client.models import PayloadSchemaType
-                    client.create_payload_index(
-                        collection_name=col_name,
-                        field_name="document_id",
-                        field_schema=PayloadSchemaType.KEYWORD,
-                    )
+                    for field in ["document_id", "file_name", "filename"]:
+                        try:
+                            client.create_payload_index(
+                                collection_name=col_name,
+                                field_name=field,
+                                field_schema=PayloadSchemaType.KEYWORD,
+                            )
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 logger.info("Qdrant collection '%s' already exists (concurrency safe).", col_name)
