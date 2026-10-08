@@ -42,7 +42,7 @@ async def signin(signin_data: SigninRequest, db: AsyncSession = Depends(get_db))
         if user is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="An account with this email address already exists",
+                detail="An account with this phone and email address already exists",
             )
         return {
             "status_code": status.HTTP_201_CREATED,

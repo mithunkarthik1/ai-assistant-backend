@@ -35,7 +35,7 @@ class AuthService:
         """Create a standard user, returning ``None`` when the email exists."""
         normalized_email = email_address.strip().lower()
         result = await self.db.execute(
-            select(User).where(User.email_address == normalized_email)
+            select(User).where(User.email_address == normalized_email, User.phone_number == phone_number, User.is_active.is_(True))
         )
         if result.scalar_one_or_none() is not None:
             return None
@@ -63,7 +63,7 @@ class AuthService:
 
     async def authenticate_user(self, email_address: str, password: str) -> User | None:
         try:
-            result = await self.db.execute(select(User).where(User.email_address == email_address))
+            result = await self.db.execute(select(User).where(User.email_address == email_address, User.is_active.is_(True)))
             user = result.scalar_one_or_none()
             if not user:
                 logger.warning("Authentication failed: user not found (%s)", email_address)
