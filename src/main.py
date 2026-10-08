@@ -16,6 +16,7 @@ from src.core.config import settings
 from src.database.connection import engine, init_db
 from src.database.qdrant import qdrant_service
 from src.rag.api import documents_router, rag_router, router as chat_router
+from src.auth.api import router as auth_router
 from src.rag.service import index_company_policy
 
 
@@ -118,4 +119,4 @@ app.include_router(rag_router)
 # Separate agentic workflow; the existing chat/RAG router remains unchanged.
 app.include_router(agents_router, prefix="/api/v1")
 app.include_router(assistant_router, prefix="/api/v1")
-
+app.include_router(auth_router, prefix="/api/v1")
