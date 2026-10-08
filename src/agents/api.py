@@ -2,12 +2,14 @@
 
 import logging
 from functools import lru_cache
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from src.agents.errors import AgentConfigurationError
 from src.agents.schema import AgentRequest, AgentResponse
 from src.agents.service import AgentService, create_agent_service
+from src.auth.dependancy import get_current_user
 from src.core.config import settings
 
 logger = logging.getLogger("src.agents.api")
@@ -29,6 +31,7 @@ def get_agent_service() -> AgentService:
 async def agent_chat(
     request: AgentRequest,
     service: AgentService = Depends(get_agent_service),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> AgentResponse:
     try:
         return await service.chat(request)

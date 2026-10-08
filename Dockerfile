@@ -2,11 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system utilities and build dependencies for psycopg/c-extensions
+# Install system utilities and build dependencies for psycopg/c-extensions, plus tesseract-ocr
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
     libpq-dev \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Install poetry
