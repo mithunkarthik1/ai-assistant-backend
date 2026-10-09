@@ -485,6 +485,59 @@ async def get_document_pages_endpoint(
     }
 
 
+@documents_router.get(
+    "/{document_id}/media/{image_name}",
+    summary="Get embedded image media from document",
+)
+async def get_document_media(
+    document_id: str,
+    image_name: str,
+):
+    """
+    Serves extracted embedded diagram and screenshot images for document handbook viewing.
+    """
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document ID format.") from e
+
+    clean_name = Path(image_name).name
+    candidates = [
+        Path("/app/data/media") / str(doc_uuid) / clean_name,
+        Path("/app/data/media") / clean_name,
+        Path("/app/data") / clean_name,
+    ]
+
+    target_file: Path | None = None
+    for p in candidates:
+        if p.exists() and p.is_file():
+            target_file = p
+            break
+
+    if not target_file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Media image '{clean_name}' not found for document '{document_id}'."
+        )
+
+    ext = target_file.suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+    }
+    content_type = media_types.get(ext, "image/png")
+
+    return FileResponse(
+        path=str(target_file),
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @documents_router.delete(
     "/{document_id}",
     summary="Delete a document and purge its vectors from index",
