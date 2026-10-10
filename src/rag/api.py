@@ -503,6 +503,10 @@ async def get_document_media(
 
     clean_name = Path(image_name).name
     candidates = [
+        Path("data/media") / str(doc_uuid) / clean_name,
+        Path("data/media") / clean_name,
+        Path("../data/media") / str(doc_uuid) / clean_name,
+        Path("../data/media") / clean_name,
         Path("/app/data/media") / str(doc_uuid) / clean_name,
         Path("/app/data/media") / clean_name,
         Path("/app/data") / clean_name,

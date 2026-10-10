@@ -457,15 +457,21 @@ def extract_text_from_docx(
             clean_r_id = re.sub(r"[^A-Za-z0-9_-]", "_", r_id)
             img_filename = f"{clean_r_id}.png"
             try:
-                if document_id:
-                    media_dir = Path("/app/data/media") / str(document_id)
-                    media_dir.mkdir(parents=True, exist_ok=True)
-                    (media_dir / img_filename).write_bytes(blob)
-                # Fallback location
-                root_media = Path("/app/data/media")
-                root_media.mkdir(parents=True, exist_ok=True)
-                (root_media / img_filename).write_bytes(blob)
-                (Path("/app/data") / img_filename).write_bytes(blob)
+                base_dirs = [
+                    Path("data/media"),
+                    Path("../data/media"),
+                    Path("/app/data/media"),
+                ]
+                for b in base_dirs:
+                    try:
+                        if document_id:
+                            m_dir = b / str(document_id)
+                            m_dir.mkdir(parents=True, exist_ok=True)
+                            (m_dir / img_filename).write_bytes(blob)
+                        b.mkdir(parents=True, exist_ok=True)
+                        (b / img_filename).write_bytes(blob)
+                    except Exception:
+                        pass
             except Exception as save_err:
                 logger.warning("Could not persist DOCX media %s: %s", r_id, save_err)
 
@@ -1780,23 +1786,46 @@ def is_dependent_followup(query: str) -> bool:
     cleaned = query.strip().lower()
     if not cleaned:
         return False
+
+    # Standalone queries should never be classified as dependent follow-ups
+    # (e.g. 'what is python', 'what is docker', 'who is elon musk', 'explain binary search')
+    standalone_patterns = (
+        r"^what\s+is\s+(?!this|that|it|its|the\s+image|the\s+diagram|the\s+table)[a-zA-Z0-9_\s]{2,}$",
+        r"^who\s+is\s+[a-zA-Z0-9_\s]{2,}$",
+        r"^how\s+(?:to|do|does)\s+[a-zA-Z0-9_\s]{2,}$",
+    )
+    if any(re.match(p, cleaned) for p in standalone_patterns):
+        # Exclude general programming / tech definitions
+        return False
+
     # Connectors indicating continuation of prior topic
     connectors = (
         "and ", "also ", "what about", "how about", "what if", "can i also",
-        "does it", "is it", "who is", "why is", "why does", "how long", "how much",
-        "tell me more", "explain more", "give more", "which one", "what is",
+        "why is that", "tell me more", "explain more", "give more", "which one",
     )
     if any(cleaned.startswith(c) for c in connectors):
         return True
+
     # Pronouns that reference earlier entities
     tokens = set(re.findall(r"\b\w+\b", cleaned))
     pronouns = {"it", "its", "this", "that", "these", "those", "them", "they", "same"}
     if tokens.intersection(pronouns) and len(tokens) <= 7:
         return True
-    # Short refinements or query fragments in ongoing conversation (e.g., "per day?", "what about stay?", "limit?")
-    words = cleaned.split()
-    if len(words) <= 5 and not is_greeting(cleaned):
+
+    # Explicit references to document elements
+    doc_refs = ("this image", "the image", "this diagram", "the diagram", "this table", "the table", "workflow", "work flow", "heading image", "sub heading")
+    if any(dr in cleaned for dr in doc_refs):
         return True
+
+    # Short query fragments lacking a subject (e.g., 'per day?', 'in probation?', 'carry forward limit?')
+    words = cleaned.split()
+    non_followup_starters = {
+        "what", "who", "why", "how", "when", "where",
+        "explain", "describe", "define", "list", "summarize", "detail", "show",
+    }
+    if len(words) <= 4 and not is_greeting(cleaned) and not any(w in non_followup_starters for w in words):
+        return True
+
     return False
 
 
@@ -1809,12 +1838,38 @@ def contextualize_query(query: str, chat_history: Sequence[Any] | None = None) -
     if not is_dependent_followup(cleaned):
         return query
 
+    # 1. Anaphoric references to recent media, images, diagrams, or sections (e.g. "explain this", "explain the image")
+    if re.search(r"\b(this|that|it|the image|this image|the diagram|this diagram|the table|this table)\b", cleaned.lower()):
+        last_asst_content = ""
+        last_user_content = ""
+        for msg in reversed(chat_history):
+            role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else "")
+            content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
+            if not last_asst_content and role == "assistant" and content.strip():
+                last_asst_content = content.strip()
+            elif not last_user_content and role in ("user", "human") and content.strip():
+                last_user_content = content.strip()
+            if last_asst_content and last_user_content:
+                break
+
+        if last_asst_content:
+            img_m = re.search(r"!\[(.*?)\]\((.*?)\)", last_asst_content)
+            doc_m = re.search(r"([a-zA-Z0-9_\-\.]+\.(?:docx|pdf|txt|md))", f"{last_user_content} {last_asst_content}", re.IGNORECASE)
+            doc_str = f" in {doc_m.group(1)}" if doc_m else ""
+            if img_m:
+                alt = img_m.group(1).strip()
+                return f"explain {alt}{doc_str}"
+            sec_m = re.search(r"(?:Section\s+)?(\d+\.?\s+[A-Za-z0-9\s]+?)(?:,|\.|\n|$)", last_asst_content)
+            if sec_m:
+                sec_title = sec_m.group(1).strip()
+                return f"explain {sec_title}{doc_str}"
+
+    # 2. General follow-up stitching with prior user query
     recent_user_queries = []
     for msg in reversed(chat_history):
         role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else "") or "user"
         content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
         if role in ("user", "human") and content.strip():
-            # Never contextualize using previous greetings
             if not is_greeting(content.strip()):
                 recent_user_queries.append(content.strip())
                 if len(recent_user_queries) >= 2:
@@ -1836,10 +1891,82 @@ COMPARISON_QUERY_PATTERNS = [
     r"\bdifference(?:s)?\s+(?:between|in)\b",
     r"\bversus\b",
     r"\bvs\.?\b",
-    r"\bboth\s+(?:documents|policies|handbooks|files)\b",
-    r"\bcompare\s+both\b",
+    r"^\s*both\b",
+    r"\bboth\b",
+    r"\bboth\s*(?:pdf|docx|docs|documents|files|policies|handbooks|of\s+them)?\b",
+    r"^\s*all\b",
+    r"\ball\s*(?:documents|policies|handbooks|files|of\s+them)?\b",
+    r"\bcompare\s*both\b",
     r"\bin\s+both\b",
+    r"\bcheck\s+both\b",
+    r"\bconsult\s+both\b",
 ]
+
+
+def resolve_clarification_from_history(
+    message: str,
+    history: Sequence[Any] | None,
+) -> tuple[str, bool]:
+    """
+    If the recent conversation state was an open disambiguation/clarification prompt:
+    - If user replied with 'both', 'all', or comparison phrases, traverses back to the substantive question
+      that triggered the clarification and returns (f"{orig_q} in both documents", True).
+    - If user named a document or gave an answer, traverses back past intermediate clarification attempts
+      to find the substantive question and returns (orig_q, False).
+    - If no clarification was active, returns (message, False).
+    """
+    if not history:
+        return message, False
+
+    raw_msgs = list(history)
+    # Check if any recent assistant message was a disambiguation prompt
+    last_asst_idx = None
+    for idx in range(len(raw_msgs) - 1, -1, -1):
+        m = raw_msgs[idx]
+        role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else "")
+        content = (getattr(m, "content", "") if not isinstance(m, dict) else m.get("content", "")).lower()
+        if role == "assistant":
+            if "specify which document" in content or "multiple documents in the knowledge base" in content:
+                last_asst_idx = idx
+                break
+            else:
+                # Ordinary assistant response; no active clarification
+                break
+
+    if last_asst_idx is None:
+        return message, False
+
+    # Find the original substantive user query that initiated the clarification dialogue
+    orig_q = ""
+    for idx in range(last_asst_idx, -1, -1):
+        m = raw_msgs[idx]
+        role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else "")
+        content = (getattr(m, "content", "") if not isinstance(m, dict) else m.get("content", "")).strip()
+        if role == "user":
+            content_lower = content.lower()
+            is_interm = (
+                is_comparison_query(content_lower)
+                or (len(content.split()) <= 4 and any(term in content_lower for term in ("both", "pdf", "docx", "all", "doc", "policy", "handbook", "1", "2")))
+            )
+            if not is_interm and len(content) > 3:
+                orig_q = content
+                break
+            elif not orig_q:
+                orig_q = content
+
+    if not orig_q:
+        orig_q = message
+
+    msg_lower = message.lower().strip()
+    is_both = (
+        msg_lower in ("both", "both pdf", "both docx", "both documents", "both files", "all", "all documents", "all of them")
+        or is_comparison_query(msg_lower)
+    )
+    if is_both:
+        return f"{orig_q} in both documents", True
+
+    return orig_q, False
+
 
 BROAD_QUERY_PATTERNS = [
     r"\ball\s+policies\b",
@@ -1970,6 +2097,37 @@ def format_clarification_message(competing_docs: list[dict[str, Any]]) -> str:
     )
 
 
+def _create_doc(
+    content: str,
+    doc_id: Any,
+    filename: str,
+    chunk_id: str,
+    section: str | None,
+    topic: str | None,
+    page: int,
+    chunk_index: int,
+    content_hash: str,
+    score: float,
+) -> Document:
+    """Helper to consistently construct a LangChain Document with normalized metadata."""
+    return Document(
+        page_content=content,
+        metadata={
+            "document_id": str(doc_id) if doc_id else "",
+            "filename": filename,
+            "file_name": filename,
+            "chunk_id": chunk_id,
+            "section": section or "",
+            "topic": topic or "",
+            "page": int(page or 1),
+            "page_number": int(page or 1),
+            "chunk_index": int(chunk_index or 0),
+            "content_hash": content_hash or "",
+            "score": round(float(score), 4),
+        },
+    )
+
+
 async def retrieve_relevant_chunks(
     query: str,
     top_k: int | None = None,
@@ -1977,9 +2135,8 @@ async def retrieve_relevant_chunks(
     document_id: uuid.UUID | None = None,
 ) -> list[Document]:
     """
-    Retrieves semantically relevant document chunks using Qdrant Cloud vector search as
-    the dedicated vector database, fetching authoritative chunk content from PostgreSQL
-    (the source-of-truth database), with seamless fallback to pgvector/local stores.
+    Retrieves semantically relevant document chunks using Qdrant Cloud vector search,
+    fetching authoritative chunk content from PostgreSQL with lexical boosting and fallbacks.
     """
     if is_greeting(query):
         return []
@@ -1991,8 +2148,6 @@ async def retrieve_relevant_chunks(
 
     try:
         q_vec = embed_query(search_query)
-        q_arr = np.array(q_vec, dtype=np.float32)
-        q_norm = float(np.linalg.norm(q_arr)) or 1e-9
     except Exception as e:
         logger.error("Failed to generate query embedding: %s", e)
         return []
@@ -2002,40 +2157,29 @@ async def retrieve_relevant_chunks(
     # 1. Primary Vector Search: Qdrant Cloud
     if qdrant_service.is_configured():
         try:
-            filters = {}
-            if document_id:
-                filters["document_id"] = str(document_id)
-
-            # When querying a specific targeted document, relax threshold so we retrieve its content
+            filters = {"document_id": str(document_id)} if document_id else None
             search_threshold = 0.05 if document_id else (min(threshold, 0.40) if broad else threshold)
             search_limit = max(k * 5, 25) if broad else (k * 3)
 
             qdrant_results = qdrant_service.search(
                 query_vector=q_vec,
                 limit=search_limit,
-                filters=filters if filters else None,
+                filters=filters,
                 score_threshold=search_threshold,
             )
 
             if qdrant_results:
-                chunk_ids = [
-                    pt.payload.get("chunk_id")
-                    for pt in qdrant_results
-                    if pt.payload and pt.payload.get("chunk_id")
-                ]
-
-                # Fetch authoritative content and metadata from PostgreSQL (source of truth)
+                chunk_ids = [pt.payload.get("chunk_id") for pt in qdrant_results if pt.payload and pt.payload.get("chunk_id")]
                 db_fetch_attempted = False
                 db_chunks: dict[str, DocumentChunk] = {}
                 doc_names: dict[str, str] = {}
                 orphan_chunk_ids: list[str] = []
+
                 try:
                     from src.database.connection import AsyncSessionLocal
                     async with AsyncSessionLocal() as session:
                         if chunk_ids:
-                            res_c = await session.execute(
-                                select(DocumentChunk).where(DocumentChunk.chunk_id.in_(chunk_ids))
-                            )
+                            res_c = await session.execute(select(DocumentChunk).where(DocumentChunk.chunk_id.in_(chunk_ids)))
                             for chk in res_c.scalars().all():
                                 db_chunks[chk.chunk_id] = chk
 
@@ -2059,48 +2203,35 @@ async def retrieve_relevant_chunks(
                         continue
                     score = float(pt.score)
 
-                    # Authoritative PostgreSQL content
                     if db_fetch_attempted:
                         if cid not in db_chunks:
-                            # Not in primary database (deleted or orphan) -> ignore & queue for Qdrant prune
                             orphan_chunk_ids.append(cid)
                             continue
                         c_rec = db_chunks[cid]
                         content = c_rec.content
                         doc_id_str = str(c_rec.document_id)
                         fname = doc_names.get(doc_id_str, payload.get("file_name", POLICY_FILENAME))
-                        sec = c_rec.section or payload.get("section")
-                        top = c_rec.topic or payload.get("topic")
-                        pg = c_rec.page_number or payload.get("page_number", 1)
-                        c_idx = c_rec.chunk_index
-                        c_hash = c_rec.content_hash or payload.get("content_hash", "")
+                        sec, top, pg, c_idx, c_hash = (
+                            c_rec.section or payload.get("section"),
+                            c_rec.topic or payload.get("topic"),
+                            c_rec.page_number or payload.get("page_number", 1),
+                            c_rec.chunk_index,
+                            c_rec.content_hash or payload.get("content_hash", ""),
+                        )
                     else:
                         content = payload.get("content") or payload.get("document", "")
                         fname = payload.get("file_name", POLICY_FILENAME)
                         doc_id_str = str(payload.get("document_id") or "")
-                        sec = payload.get("section")
-                        top = payload.get("topic")
-                        pg = int(payload.get("page_number", 1))
-                        c_idx = int(payload.get("chunk_index", 0))
-                        c_hash = payload.get("content_hash", "")
+                        sec, top, pg, c_idx, c_hash = (
+                            payload.get("section"),
+                            payload.get("topic"),
+                            int(payload.get("page_number", 1)),
+                            int(payload.get("chunk_index", 0)),
+                            payload.get("content_hash", ""),
+                        )
 
                     if content:
-                        doc = Document(
-                            page_content=content,
-                            metadata={
-                                "document_id": doc_id_str or payload.get("document_id"),
-                                "filename": fname,
-                                "file_name": fname,
-                                "chunk_id": cid,
-                                "section": sec,
-                                "topic": top,
-                                "page": pg,
-                                "page_number": pg,
-                                "chunk_index": c_idx,
-                                "content_hash": c_hash,
-                                "score": round(score, 4),
-                            },
-                        )
+                        doc = _create_doc(content, doc_id_str, fname, cid, sec, top, pg, c_idx, c_hash, score)
                         scored_chunks.append((score, doc))
 
                 if orphan_chunk_ids and qdrant_service.is_configured():
@@ -2111,6 +2242,58 @@ async def retrieve_relevant_chunks(
                         logger.warning("Failed to auto-prune orphan points from Qdrant: %s", prune_err)
         except Exception as e:
             logger.error("Qdrant similarity search encountered an error: %s. Falling back to secondary stores.", e)
+
+    # 1.1 Hybrid Lexical Match: boost chunks with exact key phrase matches from PostgreSQL
+    try:
+        from src.database.connection import AsyncSessionLocal
+        from sqlalchemy import or_
+        q_norm_lower = re.sub(r"[^\w\s-]", " ", search_query).lower()
+        stop_words = {
+            "what", "when", "where", "which", "who", "whom", "whose", "why", "how",
+            "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+            "do", "does", "did", "the", "a", "an", "and", "or", "but", "in", "on", "at",
+            "to", "for", "with", "about", "against", "between", "into", "through", "during",
+            "before", "after", "above", "below", "from", "up", "down", "out", "off", "over",
+            "under", "again", "further", "then", "once", "here", "there", "all", "any",
+            "both", "each", "few", "more", "most", "other", "some", "such", "no", "nor",
+            "not", "only", "own", "same", "so", "than", "too", "very", "can", "will", "just",
+            "should", "now", "please", "tell", "give", "show", "document", "documents",
+        }
+        tokens = [w for w in q_norm_lower.split() if len(w) >= 3 and w not in stop_words]
+        phrases = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens) - 1)]
+        key_phrases = list(dict.fromkeys(phrases[:4] + tokens[:5]))
+
+        if key_phrases:
+            async with AsyncSessionLocal() as session:
+                filters_sql = []
+                for kp in key_phrases:
+                    filters_sql.extend([
+                        DocumentChunk.content.ilike(f"%{kp}%"),
+                        DocumentChunk.section.ilike(f"%{kp}%"),
+                        DocumentChunk.topic.ilike(f"%{kp}%"),
+                    ])
+                stmt_kw = (
+                    select(DocumentChunk, DocumentModel.file_name)
+                    .join(DocumentModel, DocumentModel.document_id == DocumentChunk.document_id)
+                    .where(or_(*filters_sql))
+                )
+                if document_id:
+                    stmt_kw = stmt_kw.where(DocumentChunk.document_id == document_id)
+                stmt_kw = stmt_kw.limit(5)
+                res_kw = await session.execute(stmt_kw)
+                existing_cids = {d.metadata.get("chunk_id") for _, d in scored_chunks}
+                for chk_row in res_kw.all():
+                    c_rec, fname = chk_row[0], chk_row[1]
+                    if c_rec.chunk_id not in existing_cids:
+                        doc = _create_doc(
+                            c_rec.content, c_rec.document_id, fname, c_rec.chunk_id,
+                            c_rec.section, c_rec.topic, c_rec.page_number,
+                            c_rec.chunk_index, c_rec.content_hash, 0.88,
+                        )
+                        scored_chunks.append((0.88, doc))
+                        existing_cids.add(c_rec.chunk_id)
+    except Exception as kw_err:
+        logger.warning("Hybrid lexical search boost skipped: %s", kw_err)
 
     if not scored_chunks and document_id:
         try:
@@ -2125,21 +2308,10 @@ async def retrieve_relevant_chunks(
                 )
                 for chk_row in res.all():
                     c_rec, fname = chk_row[0], chk_row[1]
-                    doc = Document(
-                        page_content=c_rec.content,
-                        metadata={
-                            "document_id": str(c_rec.document_id),
-                            "filename": fname,
-                            "file_name": fname,
-                            "chunk_id": c_rec.chunk_id,
-                            "section": c_rec.section,
-                            "topic": c_rec.topic,
-                            "page": c_rec.page_number,
-                            "page_number": c_rec.page_number,
-                            "chunk_index": c_rec.chunk_index,
-                            "content_hash": c_rec.content_hash,
-                            "score": 0.5,
-                        },
+                    doc = _create_doc(
+                        c_rec.content, c_rec.document_id, fname, c_rec.chunk_id,
+                        c_rec.section, c_rec.topic, c_rec.page_number,
+                        c_rec.chunk_index, c_rec.content_hash, 0.5,
                     )
                     scored_chunks.append((0.5, doc))
         except Exception as db_fallback_err:
@@ -2274,6 +2446,17 @@ CRITICAL DIRECTIVES:
   • **[Document 2]**: [provisions]
   • **Key Differences**: [comparison table or bullet points]
 
+8. DIAGRAM, WORKFLOW, IMAGE & TABLE EXPLANATIONS:
+- When the user asks to explain, describe, or interpret an embedded diagram, image, flowchart, network traffic log, or data table present in the retrieved context or conversation history (e.g., "explain this", "explain this image", "explain the api endpoints", "what the workflow shows", "api endpoint table"):
+- Detail the exact endpoints, HTTP methods (GET, POST), URLs (e.g., `/api/user-stories`, `/api/attachments`, `/api/comments`, `/api/DS-20`), status codes (200 OK, 201 Created), latency, and data types depicted in the retrieved context.
+- Explain what each endpoint or diagram component represents in the system architecture clearly and professionally.
+- Never reply "This is not specified in the available documents" when the diagram content, flowchart steps, API endpoints table, OCR text, or table rows are present in the context or conversation history!
+
+9. EMBEDDED IMAGES & DIAGRAMS (MARKDOWN RENDERING):
+- When the user asks to see, show, display, or provide an image, diagram, flowchart, or schema (e.g., "show the image", "give that image", "show diagram", "display image"):
+- If the retrieved context contains markdown image tags (e.g. `![alt text](/api/v1/documents/.../media/...)`), YOU MUST INCLUDE THE EXACT MARKDOWN IMAGE TAG `![alt text](/api/v1/documents/.../media/...)` VERBATIM in your answer so the user interface renders the visual image!
+- Do NOT convert or replace markdown image tags with plain text or drop the image markdown syntax!
+
 ============================================================
 RETRIEVED KNOWLEDGE BASE
 ============================================================
@@ -2367,6 +2550,19 @@ async def generate_rag_answer(
                 "question": question,
             })
             clean_answer = str(answer).strip()
+
+            # Ensure embedded markdown image tags are preserved if the user asked to see an image
+            q_asks_img = any(w in question.lower() for w in ("show", "give", "display", "view", "see", "render", "image", "diagram", "chart"))
+            if q_asks_img and chunks:
+                chunk_img_tags = []
+                for c in chunks:
+                    matches = re.findall(r"!\[[^\]]*\]\(/api/v1/documents/[^)]+\)", c.page_content)
+                    for m in matches:
+                        if m not in chunk_img_tags:
+                            chunk_img_tags.append(m)
+                if chunk_img_tags and not any("![" in clean_answer for _ in [1]):
+                    clean_answer += "\n\n" + "\n\n".join(chunk_img_tags)
+
             is_policy_doc = any(
                 (d.metadata.get("filename") == POLICY_FILENAME or str(d.metadata.get("document_id", "")) == str(POLICY_DOC_ID))
                 for d in chunks
@@ -2542,7 +2738,7 @@ class ChatService:
                         sess.title = content[:80].strip()
 
             msg = ChatMessage(
-                document_id=document_id or DEFAULT_DOC_ID,
+                document_id=document_id,
                 session_id=session_id,
                 role=role,
                 content=content,
@@ -2644,10 +2840,16 @@ class ChatService:
                 session_id=request.session_id,
             )
 
+        # Check if user is replying to a prior document disambiguation prompt (e.g. 'both', 'both pdf', 'all', or doc selection)
+        resolved_message, is_both_selected = resolve_clarification_from_history(request.message, raw_history)
+        effective_query = resolved_message
+        if is_both_selected:
+            doc_filter = None
+
         # 2. Retrieve candidate chunks
         try:
             matching_docs = await retrieve_relevant_chunks(
-                query=request.message,
+                query=effective_query,
                 chat_history=recent_history,
                 document_id=doc_filter,
             )
@@ -2663,8 +2865,8 @@ class ChatService:
 
         # Multi-document disambiguation check:
         # Only ask when genuinely competing documents are found within margin and threshold
-        if not doc_filter and matching_docs:
-            competing = get_competing_documents(matching_docs, request.message)
+        if not doc_filter and matching_docs and not is_both_selected and not is_comparison_query(effective_query):
+            competing = get_competing_documents(matching_docs, effective_query)
             if competing:
                 clarification_answer = format_clarification_message(competing)
                 try:
@@ -2685,7 +2887,7 @@ class ChatService:
 
         # If not competing and not comparison query, and multiple documents exist:
         # If top document is dominant (gap > margin), focus matching_docs on the dominant document
-        if not doc_filter and matching_docs and not is_comparison_query(request.message):
+        if not doc_filter and matching_docs and not is_both_selected and not is_comparison_query(effective_query):
             scores_by_doc: dict[str, float] = {}
             for d in matching_docs:
                 did = str(d.metadata.get("document_id") or "")
@@ -2701,7 +2903,7 @@ class ChatService:
         # 3. Generate answer via LangChain RAG
         try:
             answer, matching_docs, show_pdf = await generate_rag_answer(
-                question=request.message,
+                question=effective_query,
                 chat_history=recent_history,
                 document_id=doc_filter,
                 pre_retrieved_chunks=matching_docs,
@@ -2837,8 +3039,8 @@ POLICY_PAGES = [
                 "bullets": [
                     "The company maintains a 40-hour work week with a mandatory 1-hour lunch break daily.",
                     "Core collaboration hours are 10:00 AM to 4:00 PM, during which team members must be reachable on Slack and available for scheduled meetings.",
-                    "Flexible working hours permit employees to adjust their start time between 8:00 AM and 10:00 AM upon manager approval."
-                ]
+                    "Flexible working hours permit employees to adjust their start time between 8:00 AM and 10:00 AM upon manager approval.",
+                ],
             },
             {
                 "num": "2",
@@ -2848,10 +3050,10 @@ POLICY_PAGES = [
                     "Full-time remote work requires prior written approval from the Department Head and People Operations.",
                     "Remote employees receive a one-time home-office setup stipend of $500 to purchase ergonomic furniture and desk equipment.",
                     "A monthly internet and utility allowance of $50 is provided to eligible remote employees.",
-                    "Employees working remotely must maintain a dedicated quiet workspace and stable internet connection of at least 50 Mbps."
-                ]
-            }
-        ]
+                    "Employees working remotely must maintain a dedicated quiet workspace and stable internet connection of at least 50 Mbps.",
+                ],
+            },
+        ],
     },
     {
         "page": 2,
@@ -2865,8 +3067,8 @@ POLICY_PAGES = [
                     "Sick and Casual Leave: Employees are entitled to 12 days of paid sick and casual leave annually. Medical certificates are required for sick leave extending beyond 3 consecutive days.",
                     "Maternity Leave: Female employees are entitled to 26 weeks of fully paid maternity leave for up to two surviving children.",
                     "Paternity Leave: Male employees and non-birthing partners are entitled to 4 weeks of fully paid parental leave to be taken within the first 6 months of childbirth or adoption.",
-                    "Bereavement Leave: 5 consecutive paid days off are provided in the event of the loss of an immediate family member."
-                ]
+                    "Bereavement Leave: 5 consecutive paid days off are provided in the event of the loss of an immediate family member.",
+                ],
             },
             {
                 "num": "4",
@@ -2876,10 +3078,10 @@ POLICY_PAGES = [
                     "Daily Meal Allowance: Capped at $75 per day without alcohol during official business travel.",
                     "Flight Booking Policy: Domestic flights under 5 hours must be booked in Economy Class; flights over 5 hours or international flights qualify for Premium Economy.",
                     "Hotel Accommodation Limit: Reimbursable up to $180 per night in tier-1 cities and $120 per night in other locations.",
-                    "Expense Submission Deadline: All expense reports and receipts must be submitted within 30 days of expense incurrence via the employee portal."
-                ]
-            }
-        ]
+                    "Expense Submission Deadline: All expense reports and receipts must be submitted within 30 days of expense incurrence via the employee portal.",
+                ],
+            },
+        ],
     },
     {
         "page": 3,
@@ -2893,8 +3095,8 @@ POLICY_PAGES = [
                     "Dependents: Policy covers the employee, spouse, and up to two dependent children.",
                     "Dental and Vision: An annual benefit of $500 per covered member is provided for preventive dental checkups, cleaning, and corrective eyewear.",
                     "Mental Health Support: Up to 8 confidential sessions per year with licensed counselors through our Employee Assistance Program (EAP).",
-                    "Wellness Stipend: $50 per month toward gym memberships, yoga classes, or fitness subscriptions."
-                ]
+                    "Wellness Stipend: $50 per month toward gym memberships, yoga classes, or fitness subscriptions.",
+                ],
             },
             {
                 "num": "6",
@@ -2903,10 +3105,10 @@ POLICY_PAGES = [
                 "bullets": [
                     "Zero Tolerance: Harassment, discrimination, or bullying based on race, gender, religion, sexual orientation, disability, or age will result in immediate disciplinary action up to termination.",
                     "Reporting: Incidents can be reported directly to People Operations, a designated HR partner, or anonymously via our confidential whistle-blower helpline.",
-                    "Non-Retaliation: Retaliation against any employee reporting a violation in good faith is strictly prohibited."
-                ]
-            }
-        ]
+                    "Non-Retaliation: Retaliation against any employee reporting a violation in good faith is strictly prohibited.",
+                ],
+            },
+        ],
     },
     {
         "page": 4,
@@ -2919,8 +3121,8 @@ POLICY_PAGES = [
                     "Multi-Factor Authentication (MFA): Mandatory for all company accounts, SSO, VPN, and email access.",
                     "Password Policy: Minimum 12 characters with a mix of uppercase, lowercase, numbers, and symbols, rotated every 90 days.",
                     "Data Classification: Customer data and source code are classified as Confidential and must never be copied to personal devices, USB drives, or unapproved cloud storage.",
-                    "Incident Reporting: Lost or stolen laptops must be reported to the IT Security Team within 2 hours of discovery for immediate remote wipe."
-                ]
+                    "Incident Reporting: Lost or stolen laptops must be reported to the IT Security Team within 2 hours of discovery for immediate remote wipe.",
+                ],
             },
             {
                 "num": "8",
@@ -2930,10 +3132,10 @@ POLICY_PAGES = [
                     "Self-evaluation followed by 360-degree peer feedback and manager review.",
                     "Performance ratings range from 1 (Needs Improvement) to 5 (Exceeds Expectations).",
                     "Promotion Eligibility: Requires minimum 12 months in current role and sustained rating of 4 or above in the previous two evaluation cycles.",
-                    "Annual Merit Increases: Effective annually on April 1 based on overall company performance and individual ratings."
-                ]
-            }
-        ]
+                    "Annual Merit Increases: Effective annually on April 1 based on overall company performance and individual ratings.",
+                ],
+            },
+        ],
     },
     {
         "page": 5,
@@ -2945,8 +3147,8 @@ POLICY_PAGES = [
                 "bullets": [
                     "Annual Learning Budget: $1,200 per full-time employee per calendar year for courses, books, workshops, and conferences.",
                     "Professional Certifications: Examination fees for relevant technical or domain certifications are 100% reimbursed upon passing.",
-                    "Study Leave: Up to 3 days of paid study leave per year for approved certification examinations."
-                ]
+                    "Study Leave: Up to 3 days of paid study leave per year for approved certification examinations.",
+                ],
             },
             {
                 "num": "10",
@@ -2956,23 +3158,17 @@ POLICY_PAGES = [
                     "Notice Period: Standard notice period is 30 days for individual contributors and 60 days for lead and managerial roles.",
                     "Notice Buyout: Permissible only with written approval from the Department Head and People Operations.",
                     "Asset Return: All company property including laptops, monitors, access cards, and company credit cards must be returned by the last working day.",
-                    "Full and Final Settlement: Processed within 30 days of the last working day, including encashment of eligible unused PTO days."
-                ]
-            }
-        ]
-    }
+                    "Full and Final Settlement: Processed within 30 days of the last working day, including encashment of eligible unused PTO days.",
+                ],
+            },
+        ],
+    },
 ]
 
 
 def generate_company_policy_pdf(target_path: Path | str | None = None) -> Path:
-    """
-    Generates an official enterprise-grade WorkPilot Company Policy Handbook PDF.
-    """
-    if target_path is None:
-        target_path = get_policy_file_path()
-    else:
-        target_path = Path(target_path)
-
+    """Generates an official enterprise-grade WorkPilot Company Policy Handbook PDF."""
+    target_path = Path(target_path) if target_path else get_policy_file_path()
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -2988,87 +3184,33 @@ def generate_company_policy_pdf(target_path: Path | str | None = None) -> Path:
     doc = SimpleDocTemplate(str(target_path), pagesize=letter, rightMargin=45, leftMargin=45, topMargin=40, bottomMargin=40)
     styles = getSampleStyleSheet()
 
-    doc_header_style = ParagraphStyle(
-        "DocHeader",
-        parent=styles["Heading1"],
-        fontName="Helvetica-Bold",
-        fontSize=15,
-        leading=19,
-        textColor=colors.HexColor("#0F172A"),
-        spaceAfter=2,
-    )
-    doc_sub_style = ParagraphStyle(
-        "DocSub",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.HexColor("#4F46E5"),
-        spaceAfter=6,
-    )
-    sec_title_style = ParagraphStyle(
-        "SecTitle",
-        parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=12,
-        leading=16,
-        textColor=colors.HexColor("#1E293B"),
-        spaceBefore=10,
-        spaceAfter=4,
-    )
-    intro_style = ParagraphStyle(
-        "IntroStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Oblique",
-        fontSize=9,
-        leading=13,
-        textColor=colors.HexColor("#475569"),
-        spaceAfter=6,
-    )
-    bullet_style = ParagraphStyle(
-        "BulletStyle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=8.5,
-        leading=12.5,
-        textColor=colors.HexColor("#1E293B"),
-        leftIndent=14,
-        spaceAfter=4,
-    )
-    page_footer_style = ParagraphStyle(
-        "PageFooter",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=8,
-        leading=10,
-        textColor=colors.HexColor("#64748B"),
-        alignment=1,
-    )
+    h_style = ParagraphStyle("DH", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=15, leading=19, textColor=colors.HexColor("#0F172A"), spaceAfter=2)
+    sub_style = ParagraphStyle("DS", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=8.5, leading=11, textColor=colors.HexColor("#4F46E5"), spaceAfter=6)
+    sec_style = ParagraphStyle("ST", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=12, leading=16, textColor=colors.HexColor("#1E293B"), spaceBefore=10, spaceAfter=4)
+    intro_style = ParagraphStyle("IS", parent=styles["Normal"], fontName="Helvetica-Oblique", fontSize=9, leading=13, textColor=colors.HexColor("#475569"), spaceAfter=6)
+    b_style = ParagraphStyle("BS", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=12.5, textColor=colors.HexColor("#1E293B"), leftIndent=14, spaceAfter=4)
+    foot_style = ParagraphStyle("PF", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=colors.HexColor("#64748B"), alignment=1)
 
     story = []
     for page_idx, page_data in enumerate(POLICY_PAGES):
         page_num = page_data["page"]
-        story.append(Paragraph("WORKPILOT ENTERPRISE COMPANY POLICY & EMPLOYEE HANDBOOK", doc_header_style))
-        story.append(Paragraph("Official Human Resources & Operations Guidelines | Confidential & Proprietary", doc_sub_style))
+        story.append(Paragraph("WORKPILOT ENTERPRISE COMPANY POLICY & EMPLOYEE HANDBOOK", h_style))
+        story.append(Paragraph("Official Human Resources & Operations Guidelines | Confidential & Proprietary", sub_style))
         story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#4F46E5"), spaceAfter=10))
 
         for sec in page_data["sections"]:
-            story.append(Paragraph(f"§ {sec['num']}. {sec['title']}", sec_title_style))
+            story.append(Paragraph(f"§ {sec['num']}. {sec['title']}", sec_style))
             if sec.get("intro"):
                 story.append(Paragraph(sec["intro"], intro_style))
 
             for bullet in sec.get("bullets", []):
-                if ":" in bullet:
-                    parts = bullet.split(":", 1)
-                    bullet_text = f"• <b>{parts[0].strip()}:</b> {parts[1].strip()}"
-                else:
-                    bullet_text = f"• {bullet.strip()}"
-                story.append(Paragraph(bullet_text, bullet_style))
+                bullet_text = f"• <b>{bullet.split(':', 1)[0].strip()}:</b> {bullet.split(':', 1)[1].strip()}" if ":" in bullet else f"• {bullet.strip()}"
+                story.append(Paragraph(bullet_text, b_style))
             story.append(Spacer(1, 6))
 
         story.append(Spacer(1, 14))
         story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CBD5E1"), spaceAfter=6))
-        story.append(Paragraph(f"Page {page_num} of 5 — WorkPilot Official Policy Handbook", page_footer_style))
+        story.append(Paragraph(f"Page {page_num} of 5 — WorkPilot Official Policy Handbook", foot_style))
 
         if page_idx < len(POLICY_PAGES) - 1:
             story.append(PageBreak())

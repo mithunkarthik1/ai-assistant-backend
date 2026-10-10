@@ -57,6 +57,7 @@ _POLICY_TERMS = (
     "pto",
     "leave",
     "sick",
+    "casual leave",
     "maternity",
     "paternity",
     "bereavement",
@@ -94,6 +95,89 @@ _POLICY_TERMS = (
     "clause",
     "summary",
     "summarize",
+    "diagram",
+    "workflow",
+    "er diagram",
+    "chart",
+    "ocr",
+    "table",
+)
+
+_GENERAL_KNOWLEDGE_TERMS = (
+    "python",
+    "javascript",
+    "typescript",
+    "java",
+    "c++",
+    "c#",
+    "golang",
+    "rust",
+    "php",
+    "html",
+    "css",
+    "sql",
+    "nosql",
+    "mongodb",
+    "react",
+    "vue",
+    "angular",
+    "node",
+    "nodejs",
+    "docker",
+    "kubernetes",
+    "git",
+    "linux",
+    "algorithm",
+    "algorithms",
+    "data structure",
+    "binary search",
+    "recursion",
+    "machine learning",
+    "deep learning",
+    "neural network",
+    "artificial intelligence",
+    "nlp",
+    "llm",
+    "rest",
+    "rest api",
+    "rest apis",
+    "write code",
+    "how to code",
+    "programming",
+    "write a script",
+    "debug this code",
+    "write a function",
+    "what is a class",
+    "what is an object",
+    "who is",
+    "who was",
+    "tell me a joke",
+    "write a poem",
+)
+
+_ANAPHORIC_FOLLOWUP_TERMS = (
+    "explain this",
+    "explain this image",
+    "explain the image",
+    "explain this diagram",
+    "what does this mean",
+    "what does this show",
+    "what does it show",
+    "what the work flow shows",
+    "what the workflow shows",
+    "show me a image",
+    "show me an image",
+    "give that image",
+    "give image",
+    "image of",
+    "heading image",
+    "sub heading image",
+    "give the content of this",
+    "tell me more about this",
+    "details of this",
+    "what is this",
+    "explain that",
+    "explain it",
 )
 
 _EXCLUDED_FROM_PROJECT_ID = {
@@ -139,6 +223,7 @@ def classify_request(
     current_project_id: str | None = None,
     explicit_project_id: str | None = None,
     known_documents: Sequence[str] | None = None,
+    history: Sequence[Any] | None = None,
 ) -> RouteDecision:
     """
     Deterministic rule-based intent router.
@@ -161,14 +246,64 @@ def classify_request(
     has_known_doc = bool(known_documents and any(doc.lower() in lower for doc in known_documents))
     has_file_ref = any(ext in lower for ext in (".pdf", ".txt", ".docx", ".doc"))
 
-    # If it asks about a document, policy, or file, prioritize RAG (policy)
+    # 2. General Knowledge / Conceptual definition checks (e.g. "what is endpoint", "what is python")
+    is_general_definition = bool(
+        re.match(r"^what\s+(?:is|are|does\s+\w+\s+mean)\s+(?:an?\s+)?([a-zA-Z0-9_\s]+?)\??$", lower)
+    )
+    has_general_coding = any(
+        re.search(r"\b" + re.escape(t) + r"\b", lower) for t in _GENERAL_KNOWLEDGE_TERMS
+    )
+    if (has_general_coding or is_general_definition) and not has_known_doc and not has_file_ref and not has_project_id and not mentions_project:
+        specific_policy_match = any(
+            p in lower for p in ("pto", "leave", "handbook", "policy", "sick leave", "notice period", "resignation", "loss of pay", "wfh")
+        )
+        if not specific_policy_match:
+            return RouteDecision(route="direct", reason="General conceptual definition or programming knowledge query.")
+
+    # 3. Follow-up / Anaphoric resolution using history
+    is_anaphoric = any(phrase in lower for phrase in _ANAPHORIC_FOLLOWUP_TERMS) or (
+        any(w in lower.split() for w in ("this", "that", "it", "its", "image", "diagram", "table", "workflow", "endpoints", "endpoint"))
+        and len(lower.split()) <= 7
+    )
+    if is_anaphoric and history and not has_project_id:
+        # Check what prior assistant or user messages were discussing
+        last_asst_text = ""
+        for msg in reversed(history):
+            role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else "")
+            content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
+            if role == "assistant" and content:
+                last_asst_text = content.lower()
+                break
+
+        # If previous assistant answer contained document references, images, tables, or policies
+        if any(
+            marker in last_asst_text
+            for marker in (".docx", ".pdf", "policy", "document", "retrieved", "table", "/media/", "diagram", "workflow", "endpoints", "endpoint")
+        ):
+            return RouteDecision(
+                route="policy",
+                reason="Follow-up question directly referring to recently retrieved document content.",
+            )
+
+    # 4. Technical specification / Document element explanation (e.g. "explain the api endpoints", "define the endpoints")
+    is_explain_or_define = bool(
+        re.match(r"^(?:explain|define|describe|show|display|give)\s+(?:the\s+)?([a-zA-Z0-9_\s\-]+)", lower)
+    )
+    has_spec_terms = any(term in lower for term in ("endpoint", "endpoints", "diagram", "workflow", "table", "schema", "architecture", "er diagram"))
+    if is_explain_or_define and has_spec_terms and not has_general_coding and not has_project_id:
+        return RouteDecision(
+            route="policy",
+            reason="Technical specification or document element explanation request.",
+        )
+
+    # 5. Standard Document & Policy Routing
     if (has_known_doc or has_file_ref) and not (has_project_id and mentions_project):
         return RouteDecision(route="policy", reason="Document or file reference detected.")
 
     if has_policy_terms and not has_project_id and not mentions_project:
         return RouteDecision(route="policy", reason="Company policy terminology detected.")
 
-    # 2. Project Management checks
+    # 6. Project Management checks
     if has_project_id or refers_to_current_project:
         return RouteDecision(
             route="project",
@@ -200,9 +335,11 @@ async def classify_request_with_model(
     explicit_project_id: str | None = None,
     known_documents: Sequence[str] | None = None,
     llm: Any = None,
+    history: Sequence[Any] | None = None,
 ) -> RouteDecision:
     """
     Model-based semantic router that uses an LLM to accurately classify user inquiries.
+    Domain-agnostic: relies on dynamic knowledge base document titles and vector similarity.
     Falls back to deterministic rules if the LLM is unconfigured, times out, or errors.
     """
     deterministic = classify_request(
@@ -210,6 +347,7 @@ async def classify_request_with_model(
         current_project_id=current_project_id,
         explicit_project_id=explicit_project_id,
         known_documents=known_documents,
+        history=history,
     )
 
     if llm is None:
@@ -218,22 +356,32 @@ async def classify_request_with_model(
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
+        recent_history_text = ""
+        if history:
+            recent_msgs = []
+            for h in history[-4:]:
+                r = getattr(h, "role", None) or (h.get("role") if isinstance(h, dict) else "")
+                c = getattr(h, "content", "") if not isinstance(h, dict) else h.get("content", "")
+                if c:
+                    recent_msgs.append(f"{r}: {c[:120]}")
+            recent_history_text = "\n".join(recent_msgs)
+
         system_msg = SystemMessage(
             content=(
-                "You are an intent classification router for an enterprise AI assistant.\n"
-                "Classify the user inquiry into one of these 4 routes:\n"
-                "- 'policy': Questions about company policies, employee handbooks, HR rules, benefits, working hours, leave, or contents of uploaded documents/files.\n"
-                "- 'project': Questions querying structured project management facts (status, milestones, owner, progress) for a specific software project (e.g., PROJ-123).\n"
-                "- 'clarification': Inquiries asking for project details/status/milestones but missing a project ID.\n"
-                "- 'direct': General knowledge questions, programming help, math, or conversational chit-chat.\n\n"
+                "You are an intelligent intent classification router for an enterprise AI assistant with access to:\n"
+                "1. 'policy': Questions about company documents, policies, employee handbooks, technical specs, internal guides, uploaded files, or any topic covered by indexed documents in the knowledge base. Also inquiries starting with 'explain ...', 'define ...', 'describe ...', or 'show ...' referring to architecture, API endpoints, diagrams, workflows, or prior document content (e.g., 'explain the api endpoints', 'explain this').\n"
+                "2. 'project': Questions querying structured project management data (status, milestones, owner, progress, tasks) for a specific software project (e.g., PROJ-123).\n"
+                "3. 'clarification': Inquiries asking for project details/status/milestones but missing a project ID.\n"
+                "4. 'direct': General conceptual definition questions ('what is <term>' or 'what does <term> mean', such as 'what is endpoint', 'what is python', 'what is rest api') without referencing a specific document, or general programming/math chit-chat.\n\n"
                 "Output strictly a JSON object with keys:\n"
                 '{"route": "policy|project|clarification|direct", "project_id": "string or null", "reason": "brief explanation"}'
             )
         )
         user_prompt = (
             f"User message: {message}\n"
+            f"Recent conversation history:\n{recent_history_text or 'none'}\n"
             f"Current project context: {current_project_id or 'none'}\n"
-            f"Known documents: {', '.join(known_documents) if known_documents else 'none'}"
+            f"Available documents in knowledge base: {', '.join(known_documents) if known_documents else 'none'}"
         )
         resp = await llm.ainvoke([system_msg, HumanMessage(content=user_prompt)])
         content = resp.content if hasattr(resp, "content") else str(resp)
