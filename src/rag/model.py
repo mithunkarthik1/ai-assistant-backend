@@ -125,10 +125,10 @@ class ChatMessage(Base):
         default=uuid.uuid4,
         index=True,
     )
-    document_id: Mapped[uuid.UUID] = mapped_column(
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         nullable=True,
-        default=DEFAULT_DOC_ID,
+        default=None,
         index=True,
     )
     session_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
