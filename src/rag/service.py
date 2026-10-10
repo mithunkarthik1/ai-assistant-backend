@@ -2281,17 +2281,27 @@ async def retrieve_relevant_chunks(
                     stmt_kw = stmt_kw.where(DocumentChunk.document_id == document_id)
                 stmt_kw = stmt_kw.limit(5)
                 res_kw = await session.execute(stmt_kw)
+                top_vector_score = scored_chunks[0][0] if scored_chunks else 0.0
                 existing_cids = {d.metadata.get("chunk_id") for _, d in scored_chunks}
                 for chk_row in res_kw.all():
                     c_rec, fname = chk_row[0], chk_row[1]
                     if c_rec.chunk_id not in existing_cids:
+                        base_lex_score = round(top_vector_score * 0.92, 4) if top_vector_score > 0 else 0.65
                         doc = _create_doc(
                             c_rec.content, c_rec.document_id, fname, c_rec.chunk_id,
                             c_rec.section, c_rec.topic, c_rec.page_number,
-                            c_rec.chunk_index, c_rec.content_hash, 0.88,
+                            c_rec.chunk_index, c_rec.content_hash, base_lex_score,
                         )
-                        scored_chunks.append((0.88, doc))
+                        scored_chunks.append((base_lex_score, doc))
                         existing_cids.add(c_rec.chunk_id)
+                    else:
+                        # Hybrid boost for chunks appearing in both vector and lexical results
+                        for idx, (sc, d) in enumerate(scored_chunks):
+                            if d.metadata.get("chunk_id") == c_rec.chunk_id:
+                                boosted = min(1.0, round(sc + 0.04, 4))
+                                d.metadata["score"] = boosted
+                                scored_chunks[idx] = (boosted, d)
+                                break
     except Exception as kw_err:
         logger.warning("Hybrid lexical search boost skipped: %s", kw_err)
 
@@ -2348,7 +2358,7 @@ async def retrieve_relevant_chunks(
         return []
 
     top_score = scored_chunks[0][0]
-    effective_threshold = max(threshold, top_score - 0.14)
+    effective_threshold = max(threshold, top_score - 0.20)
 
     # Group candidate chunks by document to ensure multi-document diversity
     docs_by_id: dict[str, list[tuple[float, Document]]] = {}
